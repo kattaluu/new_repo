@@ -175,13 +175,13 @@ post_editor = LayerEditor("Слои после квантовой части", (
 depth = w.BoundedIntText(value=2, min=1, max=20, description="Квант. слоёв:")
 embedding = w.Dropdown(options=["RY", "RX", "RZ"], value="RX", description="Кодирование:")
 rotations = w.Text(value="RY,RX", description="Вращения:")
-topology = w.Dropdown(options=[ ("Линия", "linear"),("Кольцо", "ring"), ("Полная", "full"), ("Без связей", "none"), ("Свои связи", "custom")], description="Связи:")
+topology = w.Dropdown(options=[ ("Линия", "linear"), ("Два ряда", "brickwork"),("Кольцо", "ring"), ("Полная", "full"), ("Без связей", "none"), ("Свои связи", "custom")], description="Связи:")
 custom_edges = w.Text(value="[[0,1],[1,2],[2,7]]", description="Свои связи:", layout=w.Layout(width="650px"))
 entangler = w.Dropdown(options=["CNOT", "CZ"], description="Вентиль:")
 measurement = w.Dropdown(options=["Z", "X", "Y"], description="Измерение:")
 hadamard = w.Checkbox(value=False, description="Начальные H")
 reupload = w.Checkbox(value=False, description="Повторное кодирование")
-backend = w.Dropdown(options=[("PyTorch: матрица плотности", "torch_density"), ("PennyLane: матрица плотности", "pennylane_mixed"), ("PennyLane: идеальный вектор состояния", "pennylane_statevector")], layout=w.Layout(width="500px"), description="Бэкенд:")
+backend = w.Dropdown(options=[("PyTorch: матрица плотности", "torch_density"), ("PennyLane: матрица плотности", "pennylane_mixed"), ("PennyLane: вектор состояния", "pennylane_statevector")], layout=w.Layout(width="500px"), description="Бэкенд:")
 precision = w.Dropdown(options=["float32", "float64"], description="Точность:")
 noise_on = w.Checkbox(value=True, description="Шум T1/T2 включён")
 t1 = w.Text(value="40", description="T1, мкс:", layout=w.Layout(width="650px"))
@@ -231,7 +231,50 @@ display(w.HTML("<b>Выборочный forward + аналитический Jac
                "0 shots сохраняет аналитический режим во всех случаях. Настройки применяются при создании модели."))
 """, 'model-controls')
 
+cell('markdown', r"""
+### Фиксированные ошибки операций (необязательно)
+
+Независимый от T1/T2 переключатель. Задаётся **средняя fidelity вентиля**, а не
+вероятность его успешного выполнения. Ошибка калибровки постоянна во всём запуске:
+знак генерируется по отдельному seed для каждого типа вентиля и кубита/пары кубитов.
+Вращения получают сдвиг угла вокруг своей оси, H — дополнительное вращение Z,
+CNOT/CZ — вращение ZZ. Постоянные матрицы и индексы подготавливаются при создании модели.
+Это когерентная модель; случайные сбои при каждом применении не моделируются.
+Обучение может компенсировать фиксированные сдвиги обучаемых вращений.
+Ошибки не генерируются заново между батчами или процессами CPU.
+""", 'gate-errors-help')
+
 cell('code', r"""
+gate_errors_on = w.Checkbox(value=False, description="Фиксированные ошибки вентилей")
+single_fidelity = w.BoundedFloatText(value=99.0, min=100/3, max=100,
+    description="Fidelity 1-куб., %:", style={"description_width": "initial"})
+two_fidelity = w.BoundedFloatText(value=90.0, min=20, max=100,
+    description="Fidelity 2-куб., %:", style={"description_width": "initial"})
+gate_error_seed = w.BoundedIntText(value=42, min=0, max=2**32-1,
+    description="Seed ошибок:", style={"description_width": "initial"})
+display(w.VBox([gate_errors_on, single_fidelity, two_fidelity, gate_error_seed]))
+""", 'gate-errors-controls')
+
+cell('code', r"""
+# Обновить классы после изменений кода без перезапуска ядра Jupyter.
+import importlib
+import qml_beans.model as model_module
+import qml_beans.noisy as noisy_module
+import qml_beans.vision_training as vision_module
+
+importlib.reload(model_module)
+importlib.reload(noisy_module)
+importlib.reload(vision_module)
+ModelConfig = model_module.ModelConfig
+NoiseConfig = noisy_module.NoiseConfig
+NoisyHybridClassifier = noisy_module.NoisyHybridClassifier
+circuit_schedule = noisy_module.circuit_schedule
+CPUConfig = vision_module.CPUConfig
+fit_vision = vision_module.fit_vision
+benchmark_cpu = vision_module.benchmark_cpu
+report_vision_study = vision_module.report_vision_study
+load_noisy_checkpoint = vision_module.load_noisy_checkpoint
+
 def times(text):
     values = tuple(float(value.strip()) for value in text.split(","))
     return values * 8 if len(values) == 1 else values
@@ -250,7 +293,9 @@ model_config = ModelConfig(n_features=data.train_x.shape[1], n_classes=10,
     measurement_mode=measurement_mode.value)
 noise_config = NoiseConfig(t1_us=times(t1.value), t2_us=times(t2.value),
     single_gate_us=single_time.value, two_gate_us=two_time.value, readout_idle_us=idle_time.value,
-    enabled=noise_on.value, backend=backend.value, precision=precision.value)
+    enabled=noise_on.value, backend=backend.value, precision=precision.value,
+    gate_errors=gate_errors_on.value, single_gate_fidelity=single_fidelity.value/100,
+    two_gate_fidelity=two_fidelity.value/100, gate_error_seed=gate_error_seed.value)
 seed_everything(11)
 model = NoisyHybridClassifier(model_config, noise_config)
 print("Структура энкодера:", " → ".join(map(str, (model_config.n_features, *pre_widths, 8))))
@@ -260,12 +305,35 @@ print(model.encoder)
 print(model.head)
 print("Длительность схемы, мкс:", sum(step[2] for step in circuit_schedule(model_config, noise_config)))
 if noise_config.backend == "pennylane_statevector":
-    print("Идеальный вектор состояния: 256 комплексных амплитуд на объект; T1/T2 отключены.")
+    print("Вектор состояния: 256 комплексных амплитуд на объект; T1/T2 отключены.")
 else:
     print("Элементов матрицы плотности на объект:", 256 * 256)
 
 print("Измерение:", measurement_description(model_config))
 """, 'create-model')
+
+cell('markdown', r"""
+## Квантовая цепочка
+
+Схема созданной выше модели: 8 кубитов в состоянии $|0\rangle$, без численных углов,
+с увеличенными подписями и шрифтом Times New Roman. Обучение не запускается.
+По умолчанию показаны вентили; `show_noise=True` также отображает каналы T1/T2,
+если шум включён в модели. После изменения архитектуры сначала создайте модель заново.
+""", 'circuit-description')
+
+cell('code', r"""
+import importlib
+import qml_beans.notebook as notebook_helpers
+
+importlib.reload(notebook_helpers)
+draw_vision_circuit = notebook_helpers.draw_vision_circuit
+
+output_path = ROOT / "runs" / "quantum_circuit_vision.png"
+figure, _ = draw_vision_circuit(model, output_path, show_noise=False)
+display(figure)
+print(f"Сохранено: {output_path}")
+plt.close(figure)
+""", 'draw-circuit')
 
 cell('markdown', r"""
 ## CPU: процессы, микробатчи и общий шаг оптимизатора
@@ -414,6 +482,10 @@ checkpoint_path = ""
 if checkpoint_path:
     model, checkpoint = load_noisy_checkpoint(checkpoint_path)
     model_config, noise_config = model.config, model.noise
+    gate_errors_on.value = noise_config.gate_errors
+    single_fidelity.value = 100 * noise_config.single_gate_fidelity
+    two_fidelity.value = 100 * noise_config.two_gate_fidelity
+    gate_error_seed.value = noise_config.gate_error_seed
     measurement_mode.value = model_config.measurement_mode
     measurement_shots.value = model_config.shots or 0
     measurement_seed.value = model_config.measurement_seed

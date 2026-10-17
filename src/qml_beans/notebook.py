@@ -16,6 +16,58 @@ from .training import fit, load_checkpoint, seed_everything
 DATASETS = ("Dry Bean (UCI)", "Sonar (UCI)", "Свой CSV / ARFF")
 
 
+def draw_vision_circuit(model, output=None, *, show_noise=False, fontsize=20):
+    """Draw the configured vision circuit without executing it or changing model/RNG state."""
+    import matplotlib.pyplot as plt
+    import pennylane as qml
+    from .noisy import circuit_schedule
+
+    config, noise = model.config, model.noise
+    rotations = {"RX": qml.RX, "RY": qml.RY, "RZ": qml.RZ}
+
+    def circuit(inputs, weights):
+        for gate, info, duration in circuit_schedule(config, noise):
+            if gate in ("CNOT", "CZ", "CNOT_parallel", "CZ_parallel"):
+                edges = info if gate.endswith("_parallel") else (info,)
+                for edge in edges:
+                    {"CNOT": qml.CNOT, "CZ": qml.CZ}[gate.removesuffix("_parallel")](wires=edge)
+            elif gate != "idle":
+                for wire in range(8):
+                    if gate == "H":
+                        qml.Hadamard(wires=wire)
+                    elif gate == "embed":
+                        rotations[config.embedding](torch.pi * inputs[wire], wires=wire)
+                    else:
+                        layer, gate_index = info
+                        rotations[gate](weights[layer, wire, gate_index], wires=wire)
+            if show_noise and noise.enabled and duration:
+                for wire in range(8):
+                    qml.ThermalRelaxationError(0.0, noise.t1_us[wire], noise.t2_us[wire], duration, wires=wire)
+        observable = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}[config.measurement]
+        return tuple(qml.expval(observable(wire)) for wire in range(8))
+
+    with plt.rc_context({
+        "font.family": "Times New Roman", "mathtext.fontset": "custom",
+        "mathtext.rm": "Times New Roman", "mathtext.it": "Times New Roman:italic",
+        "mathtext.bf": "Times New Roman:bold",
+    }), torch.no_grad():
+        figure, axes = qml.draw_mpl(circuit, decimals=None, fontsize=fontsize,
+                                    label_options={"fontsize": fontsize, "fontweight": "bold"})(
+                                        torch.zeros(8), model.quantum.weights.detach())
+        for axis in figure.axes:
+            for text in axis.texts:
+                text.set_fontfamily("Times New Roman")
+                if text.get_text() in {str(wire) for wire in range(8)}:
+                    text.set_text(r"$|0\rangle$")
+                if text.get_text() in {"RX", "RY", "RZ", "H", "CNOT", "CZ", "X", "Y", "Z"}:
+                    text.set_fontweight("bold")
+        if output is not None:
+            output = Path(output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            figure.savefig(output, dpi=300, bbox_inches="tight")
+    return figure, axes
+
+
 def select_dataset(root, name, *, path="", target="Class", seed=42,
                    val_size=0.15, test_size=0.2, deduplicate=True):
     root = Path(root)

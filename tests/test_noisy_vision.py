@@ -185,3 +185,29 @@ def test_read_idx_and_invalid_noise(tmp_path):
         NoiseConfig(t2_us=[10] * 7)
     with pytest.raises(ValueError):
         CPUConfig(workers=0)
+
+
+@pytest.mark.parametrize("entangler", ["CNOT", "CZ"])
+def test_brickwork_parallel_rows_physics_and_gradients(entangler):
+    from qml_beans.noisy import circuit_schedule
+
+    config = ModelConfig(8, 2, quantum_depth=1, entanglement="brickwork", entangler=entangler)
+    noise = NoiseConfig(single_gate_us=0.05, two_gate_us=0.3, precision="float64")
+    rows = [step for step in circuit_schedule(config, noise) if step[0].endswith("_parallel")]
+    assert [row[1] for row in rows] == [((0, 1), (2, 3), (4, 5), (6, 7)), ((1, 2), (3, 4), (5, 6))]
+    assert sum(step[2] for step in circuit_schedule(config, noise)) == pytest.approx(0.75)
+    custom = TorchDensityBlock(config, noise).double()
+    reference = PennyLaneMixedBlock(config, noise).double()
+    reference.weights.data.copy_(custom.weights)
+    x = torch.randn(1, 8, dtype=torch.float64, requires_grad=True)
+    a, b = custom(x), reference(x)
+    torch.testing.assert_close(a, b, atol=2e-8, rtol=2e-8)
+    ga = torch.autograd.grad(a.square().sum(), (x, custom.weights))
+    gb = torch.autograd.grad(b.square().sum(), (x, reference.weights))
+    for left, right in zip(ga, gb):
+        torch.testing.assert_close(left, right, atol=2e-7, rtol=2e-7)
+    ideal = QuantumBlock(1, config).double()
+    ideal.weights.data.copy_(custom.weights)
+    noiseless = TorchDensityBlock(config, NoiseConfig(enabled=False)).double()
+    noiseless.weights.data.copy_(custom.weights)
+    torch.testing.assert_close(ideal(x), noiseless(x), atol=1e-10, rtol=1e-10)

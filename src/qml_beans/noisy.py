@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from .model import HybridClassifier, ModelConfig, QuantumBlock
+from .gate_errors import compile_gate_errors
 from .measurements import (effective_shots, readout_with_analytic_jacobian, rotate_measurement_basis,
                            sample_expectations, sampled_with_analytic_jacobian)
 
@@ -24,8 +25,20 @@ class NoiseConfig:
     enabled: bool = True
     backend: str = "torch_density"
     precision: str = "float32"
+    gate_errors: bool = False
+    single_gate_fidelity: float = 0.99
+    two_gate_fidelity: float = 0.90
+    gate_error_seed: int = 42
 
     def __post_init__(self):
+        if type(self.gate_errors) is not bool:
+            raise ValueError("gate_errors: нужен bool")
+        for name, lower in (("single_gate_fidelity", 1 / 3), ("two_gate_fidelity", 1 / 5)):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not lower <= value <= 1:
+                raise ValueError(f"{name}: средняя fidelity должна быть в [{lower}, 1]")
+        if type(self.gate_error_seed) is not int or not 0 <= self.gate_error_seed < 2**32:
+            raise ValueError("gate_error_seed: целое от 0 до 2**32-1")
         for name in ("t1_us", "t2_us"):
             values = getattr(self, name)
             if isinstance(values, (int, float)):
@@ -49,7 +62,7 @@ class NoiseConfig:
 
 
 def circuit_schedule(config, noise):
-    """Parallel one-qubit moments; serial two-qubit gates; idles on ALL wires.
+    """Parallel one-qubit moments; serial entanglers except two parallel brickwork rows.
 
     Noise is applied after each ideal moment (gate-level, zero-temperature Markov model).
     A virtual RZ is not assumed: every configured rotation has single_gate_us duration.
@@ -63,8 +76,12 @@ def circuit_schedule(config, noise):
             operations.append(("embed", None, noise.single_gate_us))
         for gate_index, gate in enumerate(config.rotation_gates):
             operations.append((gate, (layer, gate_index), noise.single_gate_us))
-        for edge in config.edges():
-            operations.append((config.entangler, edge, noise.two_gate_us))
+        if config.entanglement == "brickwork":
+            for edges in (config.edges()[:4], config.edges()[4:]):
+                operations.append((config.entangler + "_parallel", edges, noise.two_gate_us))
+        else:
+            for edge in config.edges():
+                operations.append((config.entangler, edge, noise.two_gate_us))
     operations.append(("idle", None, noise.readout_idle_us))
     return operations
 
@@ -118,6 +135,34 @@ class TorchDensityBlock(nn.Module):
         self.config, self.noise = config, noise
         self.weights = nn.Parameter(0.05 * torch.randn(config.quantum_depth, 8, len(config.rotation_gates)))
         self.schedule = circuit_schedule(config, noise)
+        self.gate_errors = compile_gate_errors(noise)
+        if self.gate_errors:
+            # Fixed monomial two-qubit gates become one cached gather/multiply per moment.
+            indices = np.arange(256)
+            compiled = {}
+            self.compiled_gate_moments = {}
+            for moment, (gate, info, _) in enumerate(self.schedule):
+                if gate.removesuffix("_parallel") not in ("CNOT", "CZ"):
+                    continue
+                kind = gate.removesuffix("_parallel")
+                edges = info if gate.endswith("_parallel") else (info,)
+                key = (kind, edges)
+                self.compiled_gate_moments[moment] = compiled.setdefault(key, moment)
+                if self.compiled_gate_moments[moment] != moment:
+                    continue
+                permutation, phases = indices.copy(), np.ones(256, dtype=complex)
+                for control, target in edges:
+                    c, t = (indices >> (7 - control)) & 1, (indices >> (7 - target)) & 1
+                    if kind == "CNOT":
+                        permutation ^= c << (7 - target)
+                    else:
+                        phases *= 1 - 2 * (c & t)
+                    angle = self.gate_errors.two_angles[kind][control, target]
+                    phases *= np.exp(-0.5j * angle * (1 - 2 * (c ^ t)))
+                self.register_buffer(f"gate_indices_{moment}", torch.from_numpy(
+                    (permutation[:, None] * 256 + permutation[None, :]).reshape(-1)), persistent=False)
+                self.register_buffer(f"gate_phases_{moment}", torch.view_as_real(torch.from_numpy(
+                    phases[:, None] * phases.conj()[None, :])), persistent=False)
         self.sampling_rng = torch.Generator().manual_seed(config.measurement_seed)
         indices = torch.arange(256)
         self.register_buffer("z_signs", torch.stack([1 - 2 * ((indices >> (7 - wire)) & 1)
@@ -134,29 +179,41 @@ class TorchDensityBlock(nn.Module):
         rho = ket.unsqueeze(-1) * ket.conj().unsqueeze(-2)
         indices = torch.arange(256, device=inputs.device)
         for moment, (gate, info, duration) in enumerate(self.schedule):
-            if gate in ("CNOT", "CZ"):
-                control, target = info
-                active = ((indices >> (7 - control)) & 1).bool()
-                if gate == "CNOT":
-                    permutation = indices ^ (active.long() << (7 - target))
-                    rho = rho[:, permutation][:, :, permutation]
-                else:
-                    signs = 1 - 2 * (active & ((indices >> (7 - target)) & 1).bool()).to(inputs.dtype)
-                    rho = rho * signs[None, :, None] * signs[None, None, :]
+            if self.gate_errors and gate.removesuffix("_parallel") in ("CNOT", "CZ"):
+                compiled_moment = self.compiled_gate_moments[moment]
+                gather = getattr(self, f"gate_indices_{compiled_moment}")
+                phases = torch.view_as_complex(getattr(self, f"gate_phases_{compiled_moment}"))
+                phases = phases.to(dtype=dtype)
+                rho = rho.flatten(1).index_select(1, gather).reshape_as(rho) * phases
+            elif gate in ("CNOT", "CZ", "CNOT_parallel", "CZ_parallel"):
+                edges = info if gate.endswith("_parallel") else (info,)
+                for control, target in edges:
+                    active = ((indices >> (7 - control)) & 1).bool()
+                    if gate.startswith("CNOT"):
+                        permutation = indices ^ (active.long() << (7 - target))
+                        rho = rho[:, permutation][:, :, permutation]
+                    else:
+                        signs = 1 - 2 * (active & ((indices >> (7 - target)) & 1).bool()).to(inputs.dtype)
+                        rho = rho * signs[None, :, None] * signs[None, None, :]
             elif gate != "idle":
                 for wire in range(8):
                     if gate == "H":
-                        unitary = inputs.new_tensor([[1, 1], [1, -1]]).to(dtype) / math.sqrt(2)
+                        unitary = (torch.as_tensor(self.gate_errors.hadamards[wire], dtype=dtype, device=inputs.device)
+                                   if self.gate_errors else inputs.new_tensor([[1, 1], [1, -1]]).to(dtype) / math.sqrt(2))
                     elif gate == "embed":
                         theta = torch.pi * inputs[:, wire]
                         if shift is not None and (moment, wire) == shift[:2]:
                             theta = theta + shift[2]
+                        if self.gate_errors:
+                            theta = theta + self.gate_errors.offset(self.config.embedding, wire)
                         unitary = _rotation(self.config.embedding, theta)
                     else:
                         layer, gate_index = info
                         theta = weights[layer, wire, gate_index]
                         if shift is not None and (moment, wire) == shift[:2]:
                             theta = theta + shift[2]
+                        if self.gate_errors:
+                            theta = theta + self.gate_errors.offset(gate, wire)
                         unitary = _rotation(gate, theta)
                     rho = apply_unitary(rho, unitary, wire)
             if self.noise.enabled and duration:
@@ -239,20 +296,32 @@ class PennyLaneMixedBlock(nn.Module):
         rotations = {"RX": qml.RX, "RY": qml.RY, "RZ": qml.RZ}
         observable = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}[config.measurement]
         schedule = circuit_schedule(config, noise)
+        errors = compile_gate_errors(noise)
 
         def operations(inputs, weights):
             for gate, info, duration in schedule:
-                if gate in ("CNOT", "CZ"):
-                    {"CNOT": qml.CNOT, "CZ": qml.CZ}[gate](wires=info)
+                if gate in ("CNOT", "CZ", "CNOT_parallel", "CZ_parallel"):
+                    edges = info if gate.endswith("_parallel") else (info,)
+                    for edge in edges:
+                        kind = gate.removesuffix("_parallel")
+                        if errors:
+                            qml.QubitUnitary(errors.entangler(kind, edge), wires=edge)
+                        else:
+                            {"CNOT": qml.CNOT, "CZ": qml.CZ}[kind](wires=edge)
                 elif gate != "idle":
                     for wire in range(8):
                         if gate == "H":
-                            qml.Hadamard(wire)
+                            if errors:
+                                qml.QubitUnitary(errors.hadamards[wire], wires=wire)
+                            else:
+                                qml.Hadamard(wire)
                         elif gate == "embed":
-                            rotations[config.embedding](torch.pi * inputs[..., wire], wires=wire)
+                            offset = errors.offset(config.embedding, wire) if errors else 0.0
+                            rotations[config.embedding](torch.pi * inputs[..., wire] + offset, wires=wire)
                         else:
                             layer, gate_index = info
-                            rotations[gate](weights[layer, wire, gate_index], wires=wire)
+                            offset = errors.offset(gate, wire) if errors else 0.0
+                            rotations[gate](weights[layer, wire, gate_index] + offset, wires=wire)
                 if noise.enabled and duration:
                     for wire in range(8):
                         qml.ThermalRelaxationError(0.0, noise.t1_us[wire], noise.t2_us[wire], duration, wires=wire)
@@ -292,7 +361,7 @@ class NoisyHybridClassifier(HybridClassifier):
         super().__init__(config)
         self.noise = noise
         if noise.backend == "pennylane_statevector":
-            self.quantum = QuantumBlock(config.quantum_depth, config)
+            self.quantum = QuantumBlock(config.quantum_depth, config, gate_errors=compile_gate_errors(noise))
         else:
             block = TorchDensityBlock if noise.backend == "torch_density" else PennyLaneMixedBlock
             self.quantum = block(config, noise)

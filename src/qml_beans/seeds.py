@@ -370,7 +370,7 @@ def report_seed_study(paths, output, *, band="sd", show=True):
     return dict(output=str(output), config=config, rows=frame, summary=pd.DataFrame(summary), statements=statements)
 
 
-def _plot_seed_report(config, rows, summary, output, band, show):
+def _plot_seed_report(config, rows, summary, output, band, show, *, include_validation=False):
     from matplotlib.ticker import MaxNLocator
     if show:
         import matplotlib.pyplot as plt
@@ -385,7 +385,6 @@ def _plot_seed_report(config, rows, summary, output, band, show):
             FigureCanvasAgg(figure)
             return figure, figure.subplots(nrows, ncols)
 
-    fig, axes = new_figure(1, 2, figsize=(11, 4.5), constrained_layout=True)
     error_name = "sd" if band == "sd" else "ci_half_width"
     band_label = ("Среднее ± выборочное стандартное отклонение" if band == "sd"
                   else "Среднее ± приближённый 95%-й ДИ (Стьюдент)")
@@ -397,28 +396,36 @@ def _plot_seed_report(config, rows, summary, output, band, show):
                     for index, stage in enumerate(config["stages"])]
     metric_labels = (("Вневыборочная точность (%)", "Вневыборочная макро-F1 (%)")
                      if config.get("cv_folds") else ("Точность на тестовой выборке (%)", "Макро-F1 на тестовой выборке (%)"))
-    for axis, metric, label in zip(axes, ("test_accuracy", "test_macro_f1"), metric_labels):
-        for index, stage in enumerate(config["stages"]):
-            selected = [row for row in rows if row["stage"] == stage["name"]]
-            stats = next(row for row in summary if row["stage"] == stage["name"] and row["metric"] == metric)
-            offsets = np.linspace(-0.10, 0.10, len(selected)) if len(selected) > 1 else [0]
-            axis.scatter(index + np.asarray(offsets), [100 * row[metric] for row in selected],
-                         color="tab:blue", alpha=0.65, s=30, label="Отдельные запуски" if index == 0 else None)
-            error = stats[error_name]
-            axis.errorbar(index, 100 * stats["mean"], yerr=None if error is None else 100 * error,
-                          fmt="D", color="tab:orange", capsize=6, markersize=6, zorder=5,
-                          label=band_label if index == 0 else None)
-        axis.set_xticks(range(len(config["stages"])), stage_labels, rotation=15)
-        axis.set(ylabel=label, title=label)
-        axis.grid(axis="y", alpha=0.25)
-        axis.legend(fontsize=8)
     cv_note = f"; число блоков: {config['cv_folds']}" if config.get("cv_folds") else ""
-    fig.suptitle(f"Независимые запуски обучения: {len({row['seed'] for row in rows})}{cv_note}")
-    fig.savefig(output / "metrics_spread.png", dpi=160)
-    fig.savefig(output / "metrics_spread.svg")
-    if show:
-        plt.show()
-        plt.close(fig)
+    splits = [("test", "Тестовая выборка", "metrics_spread")]
+    if include_validation:
+        splits.append(("val", "Валидационная выборка", "metrics_spread_validation"))
+    for prefix, split_label, filename in splits:
+        fig, axes = new_figure(1, 2, figsize=(11, 4.5), constrained_layout=True)
+        labels = (("Точность (%)", "Макро-F1 (%)") if include_validation else metric_labels)
+        for axis, suffix, label in zip(axes, ("accuracy", "macro_f1"), labels):
+            metric = f"{prefix}_{suffix}"
+            for index, stage in enumerate(config["stages"]):
+                selected = [row for row in rows if row["stage"] == stage["name"]]
+                stats = next(row for row in summary if row["stage"] == stage["name"] and row["metric"] == metric)
+                offsets = np.linspace(-0.10, 0.10, len(selected)) if len(selected) > 1 else [0]
+                axis.scatter(index + np.asarray(offsets), [100 * row[metric] for row in selected],
+                             color="tab:blue", alpha=0.65, s=30, label="Отдельные запуски" if index == 0 else None)
+                error = stats[error_name]
+                axis.errorbar(index, 100 * stats["mean"], yerr=None if error is None else 100 * error,
+                              fmt="D", color="tab:orange", capsize=6, markersize=6, zorder=5,
+                              label=band_label if index == 0 else None)
+            axis.set_xticks(range(len(config["stages"])), stage_labels, rotation=15)
+            axis.set(ylabel=label, title=label)
+            axis.grid(axis="y", alpha=0.25)
+            axis.legend(fontsize=8)
+        split_note = f"\n{split_label}" if include_validation else ""
+        fig.suptitle(f"Независимые запуски обучения: {len({row['seed'] for row in rows})}{cv_note}{split_note}")
+        fig.savefig(output / f"{filename}.png", dpi=160)
+        fig.savefig(output / f"{filename}.svg")
+        if show:
+            plt.show()
+            plt.close(fig)
     for stage, stage_label in zip(config["stages"], stage_labels):
         selected = [row for row in rows if row["stage"] == stage["name"]]
         curves = _curves(selected, allow_ci=config["split_policy"] == "fixed")

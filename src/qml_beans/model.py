@@ -78,8 +78,9 @@ class ModelConfig:
             raise ValueError("RZ encoding needs initial Hadamard gates to encode data in relative phases")
         if not self.rotation_gates or any(gate not in ("RX", "RY", "RZ") for gate in self.rotation_gates):
             raise ValueError("Choose a nonempty ordered sequence of RX / RY / RZ rotations")
-        if self.entanglement not in ("ring", "linear", "full", "none", "custom"):
-            raise ValueError("Unsupported entanglement topology")
+        if self.entanglement not in ("ring", "linear", "brickwork", "full", "none", "custom"):
+            raise ValueError(f"Unsupported entanglement topology: {self.entanglement!r}. "
+                             "Choose ring, linear, brickwork, full, none or custom")
         if self.entangler not in ("CNOT", "CZ") or self.measurement not in ("X", "Y", "Z"):
             raise ValueError("Entangler must be CNOT/CZ and measurement must be X/Y/Z")
         for edge in self.custom_edges:
@@ -105,6 +106,8 @@ class ModelConfig:
         return self.post_activations if self.post_activations is not None else ("relu",) * len(self.head_widths)
 
     def edges(self):
+        if self.entanglement == "brickwork":
+            return ((0, 1), (2, 3), (4, 5), (6, 7), (1, 2), (3, 4), (5, 6))
         if self.entanglement == "ring":
             return tuple((wire, (wire + 1) % 8) for wire in range(8))
         if self.entanglement == "linear":
@@ -128,7 +131,7 @@ def dense_block(n_inputs, widths, activations, n_outputs, output_activation=None
 class QuantumBlock(nn.Module):
     """State vector with analytic, parameter-shift or sampled-forward/backprop readout."""
 
-    def __init__(self, depth: int, config: ModelConfig | None = None):
+    def __init__(self, depth: int, config: ModelConfig | None = None, *, gate_errors=None):
         super().__init__()
         config = config or ModelConfig(8, 2, quantum_depth=depth)
         self.config = config
@@ -143,21 +146,33 @@ class QuantumBlock(nn.Module):
 
         def embed(inputs):
             for wire in range(8):
-                rotation_ops[config.embedding](torch.pi * inputs[..., wire], wires=wire)
+                theta = torch.pi * inputs[..., wire]
+                if gate_errors:
+                    theta = theta + gate_errors.offset(config.embedding, wire)
+                rotation_ops[config.embedding](theta, wires=wire)
 
         def operations(inputs, weights):
             if config.initial_hadamard:
                 for wire in range(8):
-                    qml.Hadamard(wires=wire)
+                    if gate_errors:
+                        qml.QubitUnitary(gate_errors.hadamards[wire], wires=wire)
+                    else:
+                        qml.Hadamard(wires=wire)
             embed(inputs)
             for layer in range(depth):
                 if layer > 0 and config.reupload:
                     embed(inputs)
                 for wire in range(8):
                     for gate_index, gate in enumerate(config.rotation_gates):
-                        rotation_ops[gate](weights[layer, wire, gate_index], wires=wire)
+                        theta = weights[layer, wire, gate_index]
+                        if gate_errors:
+                            theta = theta + gate_errors.offset(gate, wire)
+                        rotation_ops[gate](theta, wires=wire)
                 for edge in config.edges():
-                    entangler(wires=edge)
+                    if gate_errors:
+                        qml.QubitUnitary(gate_errors.entangler(config.entangler, edge), wires=edge)
+                    else:
+                        entangler(wires=edge)
 
         strict_shots = bool(self.shots and config.measurement_mode == "parameter_shift")
 

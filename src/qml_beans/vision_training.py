@@ -19,7 +19,7 @@ from torch import nn
 
 from .model import ModelConfig
 from .noisy import NoiseConfig, NoisyHybridClassifier
-from .seeds import _plot_seed_report, summarize_seed_runs
+from .seeds import _plot_seed_report, sample_statistics, summarize_seed_runs
 from .training import classification_metrics, seed_everything, write_json
 
 
@@ -249,18 +249,34 @@ def benchmark_cpu(model, x, y, configurations, *, repeats=2):
     return pd.DataFrame(records)
 
 
-def report_vision_study(paths, output, *, band="sd", show=True):
-    """Collect separate image runs with matching protocol and independent initialization seeds."""
+def report_vision_study(paths, output, *, band="sd", show=True, seeds=None):
+    """Report all runs or only the initialization seeds explicitly selected by ``seeds``."""
     if band not in ("sd", "ci95"):
         raise ValueError("band: sd или ci95")
-    rows, identities, seen_seeds = [], set(), set()
+    selected_seeds = None
+    if seeds is not None:
+        seeds = list(seeds)
+        if not seeds or any(isinstance(seed, (bool, np.bool_)) or not isinstance(seed, (int, np.integer)) for seed in seeds):
+            raise ValueError("seeds: непустой список целых начальных значений или None для всех запусков")
+        selected_seeds = {int(seed) for seed in seeds}
+        if len(selected_seeds) != len(seeds):
+            raise ValueError("seeds не должен содержать повторные начальные значения")
+    runs = []
     for path in paths:
         path = Path(path)
         metrics = json.loads((path / "metrics.json").read_text(encoding="utf-8"))
-        if len(paths) > 1 and metrics["settings"].get("initialization") == "continued":
+        if selected_seeds is None or metrics["settings"]["seed"] in selected_seeds:
+            runs.append((path, metrics))
+    if selected_seeds is not None:
+        missing = selected_seeds - {metrics["settings"]["seed"] for _, metrics in runs}
+        if missing:
+            raise ValueError(f"В переданных папках не найдены seed: {sorted(missing)}")
+    rows, identities, seen_seeds = [], set(), set()
+    for path, metrics in runs:
+        if len(runs) > 1 and metrics["settings"].get("initialization") == "continued":
             raise ValueError("Продолжаемые модели нельзя объявлять независимыми инициализациями")
         settings = {k: v for k, v in metrics["settings"].items() if k not in ("seed", "cpu")}
-        protocol = dict(model=asdict(ModelConfig(**metrics["model_config"])), noise=metrics["noise_config"], mode=metrics["mode"],
+        protocol = dict(model=asdict(ModelConfig(**metrics["model_config"])), noise=asdict(NoiseConfig(**metrics["noise_config"])), mode=metrics["mode"],
                         data=metrics["data"], settings=settings)
         identities.add(hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest())
         seed = metrics["settings"]["seed"]
@@ -271,17 +287,21 @@ def report_vision_study(paths, output, *, band="sd", show=True):
                          stage_index=0, output=str(path),
                          **{f"test_{key}": metrics["test"][key] for key in ("accuracy", "macro_f1", "balanced_accuracy", "loss")},
                          val_accuracy=metrics["validation"]["accuracy"],
+                         val_macro_f1=metrics["validation"]["macro_f1"],
                          history=json.loads((path / "history.json").read_text(encoding="utf-8"))))
     if not rows:
         raise ValueError("Нет результатов для сбора")
     config = dict(split_policy="fixed", stages=[dict(name=rows[0]["stage"])])
     summary = summarize_seed_runs(config, rows)
+    summary.append(dict(stage=rows[0]["stage"], metric="val_macro_f1",
+                        **sample_statistics([row["val_macro_f1"] for row in rows])))
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / "summary.json", dict(protocol=protocol, statistics=summary, band=band,
+               selected_seeds=sorted(seen_seeds),
                interpretation="ДИ среднего по независимым начальным значениям при фиксированной выборке; "
                "не является погрешностью для генеральной совокупности. При одном запуске разброс не определён."))
     pd.DataFrame(summary).to_csv(output / "summary.csv", index=False)
     pd.DataFrame([{k: v for k, v in row.items() if k != "history"} for row in rows]).to_csv(output / "per_seed.csv", index=False)
-    _plot_seed_report(config, rows, summary, output, band, show)
+    _plot_seed_report(config, rows, summary, output, band, show, include_validation=True)
     return pd.DataFrame(summary)
