@@ -7,6 +7,7 @@ import torch
 
 from .data import download_dry_bean, download_sonar, load_table, prepare_data, transform_features
 from .model import HybridClassifier, ModelConfig
+from .measurements import MEASUREMENT_MODES
 from .training import evaluate, fit, load_checkpoint, predict_logits, seed_everything, write_json
 
 
@@ -47,6 +48,10 @@ def parser():
     train.add_argument("--pre-hidden", type=positive_int, default=None)
     train.add_argument("--post-hidden", type=positive_int, default=None)
     train.add_argument("--quantum-depth", type=positive_int, default=None)
+    train.add_argument("--shots", type=int, default=None, help="Measurement repetitions per object; 0=analytic; inherited for checkpoints")
+    train.add_argument("--measurement-seed", type=int, default=None, help="Sampling RNG seed (default 42)")
+    train.add_argument("--measurement-mode", choices=MEASUREMENT_MODES, default=None,
+                       help="parameter_shift, sampled_backprop, or analytic_train (shots only in eval); inherited for checkpoints")
     train.add_argument("--epochs", type=positive_int, default=20)
     train.add_argument("--batch-size", type=positive_int, default=64)
     train.add_argument("--lr", type=positive_float, default=1e-3)
@@ -80,6 +85,8 @@ def dataset_path(args):
 def run_train(args):
     if args.patience < 0 or not 0 <= args.weight_decay < float("inf"):
         raise ValueError("patience and weight-decay must be nonnegative and finite")
+    if args.shots is not None and args.shots < 0:
+        raise ValueError("shots must be nonnegative (0=analytic)")
     torch.set_num_threads(args.threads)
     seed_everything(args.seed)
     path = dataset_path(args)
@@ -89,6 +96,12 @@ def run_train(args):
             value = getattr(args, option)
             if value is not None and value != getattr(model.config, option):
                 raise ValueError(f"Cannot change {option} when loading a checkpoint")
+        for option in ("shots", "measurement_seed", "measurement_mode"):
+            value = getattr(args, option)
+            if option == "shots" and value == 0:
+                value = None
+            if getattr(args, option) is not None and value != getattr(model.config, option):
+                raise ValueError(f"Cannot change {option} when loading a checkpoint")
         data = prepare_data(path, saved_metadata=checkpoint["data"])
         mode = model.mode_dict()
     else:
@@ -97,7 +110,9 @@ def run_train(args):
         model = HybridClassifier(ModelConfig(
             n_features=data.x.shape[1], n_classes=len(data.metadata["classes"]),
             pre_hidden=args.pre_hidden or 32, post_hidden=args.post_hidden or 16,
-            quantum_depth=args.quantum_depth or 2))
+            quantum_depth=args.quantum_depth or 2, shots=args.shots or None,
+            measurement_seed=args.measurement_seed if args.measurement_seed is not None else 42,
+            measurement_mode=args.measurement_mode or "parameter_shift"))
         mode = model.mode_dict()
     for name in mode:
         if getattr(args, name) is not None:

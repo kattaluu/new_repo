@@ -66,9 +66,11 @@ def _init_worker(model_config, noise_config, mode, shared_state, tensors, cpu):
 
 
 def _worker_task(task):
-    split, indices, backward = task
+    split, indices, backward, training, measurement_seed = task
     _WORKER_MODEL.load_state_dict(_SHARED_STATE)
-    _WORKER_MODEL.train(backward)
+    _WORKER_MODEL.train(training)
+    if measurement_seed is not None:
+        _WORKER_MODEL.quantum.set_measurement_seed(measurement_seed)
     x, y = _TENSORS[split]
     return _compute(_WORKER_MODEL, x[indices], y[indices], _CPU.microbatch_size, backward)
 
@@ -80,6 +82,7 @@ class CPUEngine:
         self.tensors = {name: (x.to(dtype=dtype).contiguous(), y.long().contiguous())
                         for name, (x, y) in tensors.items()}
         self.pool = None
+        self.measurement_step = 0
 
     def __enter__(self):
         self.old_threads = torch.get_num_threads()
@@ -101,21 +104,30 @@ class CPUEngine:
             self.pool.shutdown(wait=True, cancel_futures=True)
         torch.set_num_threads(self.old_threads)
 
-    def run(self, split, indices, *, backward=False):
+    def run(self, split, indices, *, backward=False, training=None):
         indices = torch.as_tensor(indices, dtype=torch.long)
         if len(indices) == 0:
             raise ValueError("Пустой батч")
-        self.model.train(backward)
+        training = backward if training is None else training
+        self.model.train(training)
         if self.cpu.parallel_mode == "split_batch":
             chunks = [part for part in torch.tensor_split(indices, self.cpu.workers) if len(part)]
         else:
             chunks = list(indices.split(self.cpu.microbatch_size))
+        self.measurement_step += 1
+        seeds = [int(np.random.SeedSequence([self.model.config.measurement_seed, self.measurement_step,
+                                             {"train": 0, "val": 1, "test": 2}[split], index]).generate_state(1)[0])
+                 if self.model.config.shots is not None else None for index in range(len(chunks))]
         if self.pool:
             # map is ordered and constitutes a full barrier before the next optimizer step.
-            results = list(self.pool.map(_worker_task, [(split, part, backward) for part in chunks]))
+            results = list(self.pool.map(_worker_task, [(split, part, backward, training, seed) for part, seed in zip(chunks, seeds)]))
         else:
             x, y = self.tensors[split]
-            results = [_compute(self.model, x[part], y[part], self.cpu.microbatch_size, backward) for part in chunks]
+            results = []
+            for part, seed in zip(chunks, seeds):
+                if seed is not None:
+                    self.model.quantum.set_measurement_seed(seed)
+                results.append(_compute(self.model, x[part], y[part], self.cpu.microbatch_size, backward))
         if backward:
             for index, param in enumerate(self.model.parameters()):
                 values = [r[0][index] for r in results if r[0][index] is not None]
@@ -182,7 +194,7 @@ def fit_vision(model, data, output, *, cpu=CPUConfig(), epochs=10, batch_size=32
             order = torch.randperm(len(data.train_y), generator=generator)
             losses, correct = 0.0, 0
             for indices in order.split(batch_size):
-                loss, logits = engine.run("train", indices, backward=optimizer is not None)
+                loss, logits = engine.run("train", indices, backward=optimizer is not None, training=True)
                 if optimizer:
                     optimizer.step()
                 losses += loss * len(indices)
@@ -248,7 +260,7 @@ def report_vision_study(paths, output, *, band="sd", show=True):
         if len(paths) > 1 and metrics["settings"].get("initialization") == "continued":
             raise ValueError("Продолжаемые модели нельзя объявлять независимыми инициализациями")
         settings = {k: v for k, v in metrics["settings"].items() if k not in ("seed", "cpu")}
-        protocol = dict(model=metrics["model_config"], noise=metrics["noise_config"], mode=metrics["mode"],
+        protocol = dict(model=asdict(ModelConfig(**metrics["model_config"])), noise=metrics["noise_config"], mode=metrics["mode"],
                         data=metrics["data"], settings=settings)
         identities.add(hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest())
         seed = metrics["settings"]["seed"]

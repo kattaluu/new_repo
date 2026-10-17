@@ -15,6 +15,8 @@ def cell(kind, source, identifier):
 
 
 
+
+
 cell('markdown', r"""
 # Изображения: гибридная модель с T1/T2 и параллельным обучением на CPU
 
@@ -28,8 +30,7 @@ cell('markdown', r"""
 - `pennylane_mixed`: эталонный `default.mixed`, `ThermalRelaxationError`, `backprop`;
 - `pennylane_statevector`: идеальный `default.qubit` без T1/T2, для сравнения с шумовыми моделями.
 
-Используются аналитические средние, без случайных траекторий и шума измерений.
-Поэтому один seed отвечает за инициализацию весов и порядок данных, а не за реализации шума.
+Шум T1/T2 рассчитывается детерминированно через матрицу плотности. Статистика измерений задаётся отдельно числом shots. Seed обучения отвечает за веса и порядок данных, seed измерений — за выборку результатов.
 «Точный» здесь относится к эволюции выбранного канала, а не к гарантированной точности классификации.
 `float64` полезен для проверки; `float32` экономит память. Быстродействие измеряется ниже.
 """, 'intro')
@@ -63,6 +64,8 @@ from qml_beans.seeds import parse_seeds
 from qml_beans.training import seed_everything
 plt.rcParams.update({"font.family": "Times New Roman", "axes.unicode_minus": False})
 print("CPU:", os.cpu_count(), "| PyTorch:", torch.__version__)
+
+from qml_beans.measurements import measurement_description
 """, 'imports')
 
 cell('markdown', r"""
@@ -82,11 +85,11 @@ cell('markdown', r"""
 """, 'data-help')
 
 cell('code', r"""
-dataset = w.Dropdown(options=list(DATASET_CLASSES), value="MNIST", description="Датасет:")
+dataset = w.Dropdown(options=list(DATASET_CLASSES), value="Fashion MNIST", description="Датасет:")
 image_size = w.BoundedIntText(value=14, min=2, max=32, description="Сторона, пкс:", style={"description_width": "initial"}, tooltip="Изображение будет уменьшено до указанного числа пикселей по каждой стороне: 14 означает 14×14")
 small_data = w.Checkbox(value=True, description="Пробная стратифицированная подвыборка")
-train_limit = w.BoundedIntText(value=1000, min=10, max=60000, description="Обучение:")
-val_limit = w.BoundedIntText(value=200, min=10, max=10000, description="Валидация:")
+train_limit = w.BoundedIntText(value=1250, min=10, max=60000, description="Обучение:")
+val_limit = w.BoundedIntText(value=250, min=10, max=10000, description="Валидация:")
 test_limit = w.BoundedIntText(value=500, min=10, max=10000, description="Тест:")
 split_seed = w.IntText(value=42, description="Seed разбиения:", style={"description_width": "initial"})
 val_size = w.BoundedFloatText(value=0.15, min=0.01, max=0.5, description="Доля валидации:", style={"description_width": "initial"})
@@ -128,6 +131,42 @@ $\rho_{01}(t)=\rho_{01}(0)e^{-t/T_2}$.
 Для идеального вектора состояния T1/T2 отключаются: релаксация и дефазировка в общем случае создают смешанное состояние, которому нужна матрица плотности. При возврате к шумовому бэкенду прежние T1/T2 и выбор включения шума восстанавливаются.
 
 Редактор задаёт только скрытые слои. Для одного скрытого слоя `(32,)` используется одна активация: первый элемент `("relu", "tanh")`, то есть `relu`; второй элемент этого списка не используется. Активация выхода энкодера `tanh` задаётся отдельно полем `latent_activation` конфигурации модели.
+
+
+### Число измерений (shots)
+
+Поле **«Измерений (shots)»**: `0` — аналитическое среднее (`shots=None`);
+положительное число, например `1024`, — столько повторений измерения на каждый объект.
+Оценка Pauli Z равна $(N_0-N_1)/N$; для X/Y измерения выполняются в соответствующем базисе.
+Все 8 кубитов измеряются совместно, один набор shots даёт 8 средних и сохраняет корреляции.
+На векторе состояния shots моделируют статистику измерений идеальной схемы;
+на матрице плотности — статистику измерений состояния с T1/T2.
+
+Способ расчёта градиента выбирается в поле **«Режим измерений»**. Parameter-shift использует дополнительные сдвинутые схемы; два новых режима используют backprop через аналитическую симуляцию.
+Параметры сохраняются в checkpoint, конфигурациях серий и метриках.
+Повторная оценка может отличаться из-за статистического шума. «Seed измерений» фиксирует
+поток случайных измерений; CPU-процессы получают разные подпотоки. Для воспроизводимости
+полного запуска сохраняйте также число процессов, микробатч и порядок вычислений.
+
+
+### Режим измерений и градиента
+
+- **Выборочный forward + аналитический Jacobian** (`sampled_backprop`): на вход
+  классической головы поступают настоящие совместные измерения восьми кубитов.
+  Обратный проход использует Jacobian точного среднего, без parameter-shift.
+  Это быстрый суррогатный градиент; он в общем случае смещён относительно градиента
+  математического ожидания нелинейной конечной-shot функции потерь.
+- **Аналитическое обучение, shots при оценке** (`analytic_train`): `model.train()`
+  использует точные средние и backprop; `model.eval()` использует заданные shots.
+  **Валидация и тест оба выборочные**, поэтому early stopping видит шумную оценку.
+  `torch.no_grad()` сам по себе не переключает режим измерений.
+- **Выборочные измерения + parameter-shift** (`parameter_shift`): прежний режим,
+  выборочные средние и Jacobian через сдвинутые схемы. Оценка квантового Jacobian
+  не гарантирует несмещённости градиента полной нелинейной конечной-shot функции потерь.
+
+Все режимы поддерживают state vector и оба бэкенда матрицы плотности с T1/T2.
+При 0 shots все режимы аналитические. Выбор режима, shots и seed входят в checkpoint
+и протокол серии; разные режимы не объединяются в одну статистику.
 """, 'noise-help')
 
 cell('code', r"""
@@ -148,7 +187,7 @@ noise_on = w.Checkbox(value=True, description="Шум T1/T2 включён")
 t1 = w.Text(value="40", description="T1, мкс:", layout=w.Layout(width="650px"))
 t2 = w.Text(value="30", description="T2, мкс:", layout=w.Layout(width="650px"))
 single_time = w.BoundedFloatText(value=0.05, min=0, max=1e6, description="1-куб., мкс:")
-two_time = w.BoundedFloatText(value=0.3, min=0, max=1e6, description="2-куб., мкс:")
+two_time = w.BoundedFloatText(value=0.05, min=0, max=1e6, description="2-куб., мкс:")
 idle_time = w.BoundedFloatText(value=0.0, min=0, max=1e6, description="Ожидание, мкс:")
 display(pre_editor.view, post_editor.view)
 display(w.VBox([depth, embedding, rotations, topology, custom_edges, entangler, measurement, hadamard, reupload,
@@ -173,6 +212,23 @@ sync_backend_controls()
 display(w.HTML("<b>Редакторы задают скрытые слои.</b> Число входных признаков определяется изображением; "
                "выход энкодера всегда содержит 8 параметров углового кодирования. "
                "После измерений получаются 8 признаков; выход классификатора — 10 классов."))
+
+measurement_shots = w.BoundedIntText(value=1000, min=0, max=10000000, description="Измерений (shots):",
+    style={"description_width": "initial"}, tooltip="0 — аналитическое среднее; например, 1024 — среднее по 1024 измерениям на объект")
+measurement_seed = w.BoundedIntText(value=42, min=0, max=2**32-1, description="Seed измерений:",
+    style={"description_width": "initial"})
+display(w.HBox([measurement_shots, measurement_seed]))
+measurement_mode = w.Dropdown(options=[
+    ("Выборочные измерения + parameter-shift", "parameter_shift"),
+    ("Выборочный forward + аналитический Jacobian", "sampled_backprop"),
+    ("Аналитическое обучение, shots при оценке", "analytic_train"),
+], value="parameter_shift", description="Режим измерений:",
+   style={"description_width": "initial"}, layout=w.Layout(width="850px"))
+display(measurement_mode)
+display(w.HTML("<b>Выборочный forward + аналитический Jacobian:</b> реальные конечные измерения на входе "
+               "головы, быстрый суррогатный backprop. <br><b>Аналитическое обучение:</b> точные средние "
+               "при обучении; заданные shots при валидации и тестировании. <br>"
+               "0 shots сохраняет аналитический режим во всех случаях. Настройки применяются при создании модели."))
 """, 'model-controls')
 
 cell('code', r"""
@@ -189,7 +245,9 @@ model_config = ModelConfig(n_features=data.train_x.shape[1], n_classes=10,
     rotation_gates=tuple(g.strip().upper() for g in rotations.value.split(",") if g.strip()),
     entanglement=topology.value, custom_edges=parse_edges(custom_edges.value),
     entangler=entangler.value, measurement=measurement.value,
-    initial_hadamard=hadamard.value, reupload=reupload.value)
+    initial_hadamard=hadamard.value, reupload=reupload.value,
+    shots=measurement_shots.value or None, measurement_seed=measurement_seed.value,
+    measurement_mode=measurement_mode.value)
 noise_config = NoiseConfig(t1_us=times(t1.value), t2_us=times(t2.value),
     single_gate_us=single_time.value, two_gate_us=two_time.value, readout_idle_us=idle_time.value,
     enabled=noise_on.value, backend=backend.value, precision=precision.value)
@@ -205,6 +263,8 @@ if noise_config.backend == "pennylane_statevector":
     print("Идеальный вектор состояния: 256 комплексных амплитуд на объект; T1/T2 отключены.")
 else:
     print("Элементов матрицы плотности на объект:", 256 * 256)
+
+print("Измерение:", measurement_description(model_config))
 """, 'create-model')
 
 cell('markdown', r"""
@@ -231,13 +291,13 @@ cell('markdown', r"""
 """, 'cpu-help')
 
 cell('code', r"""
-workers = w.BoundedIntText(value=2, min=1, max=os.cpu_count() or 1, description="Процессов:")
+workers = w.BoundedIntText(value=16, min=1, max=os.cpu_count() or 1, description="Процессов:")
 threads = w.BoundedIntText(value=1, min=1, max=os.cpu_count() or 1, description="Потоков/проц.:")
 microbatch = w.BoundedIntText(value=2, min=1, max=256, description="Микробатч:")
 parallel_mode = w.Dropdown(options=[("Части батча", "split_batch"), ("Очередь микробатчей", "batch_queue")], description="Режим:")
-batch_size = w.BoundedIntText(value=32, min=1, max=4096, description="Размер батча:")
-epochs = w.BoundedIntText(value=10, min=1, max=10000, description="Эпох:")
-patience = w.BoundedIntText(value=5, min=0, max=10000, description="Терпение:")
+batch_size = w.BoundedIntText(value=96, min=1, max=4096, description="Размер батча:")
+epochs = w.BoundedIntText(value=100, min=1, max=10000, description="Эпох:")
+patience = w.BoundedIntText(value=20, min=0, max=10000, description="Терпение:")
 min_delta = w.BoundedFloatText(value=0.0, min=0.0, max=100, description="Мин. улучшение:")
 learning_rate = w.FloatText(value=1e-3, description="Шаг классич.:")
 quantum_rate = w.FloatText(value=1e-3, description="Шаг квант.:")
@@ -265,7 +325,7 @@ cell('markdown', r"""
 """, 'benchmark-help')
 
 cell('code', r"""
-run_benchmark = True  # True для измерения; обучение не запускается
+run_benchmark = False  # True для измерения; обучение не запускается
 if run_benchmark:
     model.set_mode(quantum=use_quantum.value, train_classical=train_classical.value, train_quantum=train_quantum.value)
     configurations = [replace(current_cpu(), workers=1)]
@@ -354,6 +414,9 @@ checkpoint_path = ""
 if checkpoint_path:
     model, checkpoint = load_noisy_checkpoint(checkpoint_path)
     model_config, noise_config = model.config, model.noise
+    measurement_mode.value = model_config.measurement_mode
+    measurement_shots.value = model_config.shots or 0
+    measurement_seed.value = model_config.measurement_seed
     use_quantum.value = model.use_quantum
     train_classical.value = model.train_classical
     train_quantum.value = model.train_quantum

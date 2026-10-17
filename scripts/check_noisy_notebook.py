@@ -9,6 +9,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="MNIST", choices=["MNIST", "Fashion MNIST", "CIFAR-10"])
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--shots", type=int, default=0, help="0=analytic; positive=finite measurement shots")
+    parser.add_argument("--measurement-mode", default="parameter_shift",
+                        choices=["parameter_shift", "sampled_backprop", "analytic_train"])
     parser.add_argument("--backend", default="torch_density", choices=["torch_density", "pennylane_mixed", "pennylane_statevector"])
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -33,7 +36,9 @@ post_editor.count.value = 1
 post_editor.rows[0][0].value = 8
 depth.value = 1
 topology.value = "none"
-backend.value = {args.backend!r}''',
+backend.value = {args.backend!r}
+measurement_shots.value = {args.shots}
+measurement_mode.value = {args.measurement_mode!r}''',
         "training-controls": f'''workers.value = {args.workers}
 microbatch.value = 1
 batch_size.value = 10
@@ -46,7 +51,8 @@ output_name.value = "noisy_notebook_smoke"''',
             cell.source += "\n\n" + additions[cell.id]
     client = NotebookClient(notebook, timeout=600, kernel_name="qml-beans", resources={"metadata": {"path": str(root)}})
     client.execute()
-    destination = root / "runs" / f"noisy_notebook_{args.dataset.replace(' ', '_')}_{args.backend}_checked.ipynb"
+    destination = root / "runs" / (f"noisy_notebook_{args.dataset.replace(' ', '_')}_{args.backend}_"
+                                    f"{args.measurement_mode}_shots{args.shots}_checked.ipynb")
     nbformat.write(notebook, destination)
     print(destination)
 

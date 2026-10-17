@@ -15,7 +15,9 @@ def cell(kind, text, tag):
     cells.append(content)
 
 
-cell("markdown", """
+
+
+cell('markdown', r"""
 # Конструктор гибридной квантовой модели
 
 **8 кубитов · PyTorch + PennyLane · классические слои до и после схемы.**
@@ -37,9 +39,44 @@ cell("markdown", """
 Ноутбук использует `src/qml_beans` из этого проекта; сохраняйте структуру папок.
 Предобработка обучается только на train. Val выбирает лучшие веса; test служит для
 итогового отчёта каждого этапа. Не подбирайте архитектуру по результатам test.
-""", "intro")
 
-cell("markdown", r"""
+### Число измерений (shots)
+
+Поле **«Измерений (shots)»**: `0` — аналитическое среднее (`shots=None`);
+положительное число, например `1024`, — столько повторений измерения на каждый объект.
+Оценка Pauli Z равна $(N_0-N_1)/N$; для X/Y измерения выполняются в соответствующем базисе.
+Все 8 кубитов измеряются совместно, один набор shots даёт 8 средних и сохраняет корреляции.
+На векторе состояния shots моделируют статистику измерений идеальной схемы;
+на матрице плотности — статистику измерений состояния с T1/T2.
+
+Способ расчёта градиента выбирается в поле **«Режим измерений»**. Parameter-shift использует дополнительные сдвинутые схемы; два новых режима используют backprop через аналитическую симуляцию.
+Параметры сохраняются в checkpoint, конфигурациях серий и метриках.
+Повторная оценка может отличаться из-за статистического шума. «Seed измерений» фиксирует
+поток случайных измерений; CPU-процессы получают разные подпотоки. Для воспроизводимости
+полного запуска сохраняйте также число процессов, микробатч и порядок вычислений.
+
+
+### Режим измерений и градиента
+
+- **Выборочный forward + аналитический Jacobian** (`sampled_backprop`): на вход
+  классической головы поступают настоящие совместные измерения восьми кубитов.
+  Обратный проход использует Jacobian точного среднего, без parameter-shift.
+  Это быстрый суррогатный градиент; он в общем случае смещён относительно градиента
+  математического ожидания нелинейной конечной-shot функции потерь.
+- **Аналитическое обучение, shots при оценке** (`analytic_train`): `model.train()`
+  использует точные средние и backprop; `model.eval()` использует заданные shots.
+  **Валидация и тест оба выборочные**, поэтому early stopping видит шумную оценку.
+  `torch.no_grad()` сам по себе не переключает режим измерений.
+- **Выборочные измерения + parameter-shift** (`parameter_shift`): прежний режим,
+  выборочные средние и Jacobian через сдвинутые схемы. Оценка квантового Jacobian
+  не гарантирует несмещённости градиента полной нелинейной конечной-shot функции потерь.
+
+Все режимы поддерживают state vector и оба бэкенда матрицы плотности с T1/T2.
+При 0 shots все режимы аналитические. Выбор режима, shots и seed входят в checkpoint
+и протокол серии; разные режимы не объединяются в одну статистику.
+""", 'intro')
+
+cell('markdown', r"""
 ## Окружение
 
 В терминале из корня проекта:
@@ -53,9 +90,9 @@ cell("markdown", r"""
 В VS Code выберите ядро `.venv` / `Python (qml-beans)`. Если окружения ещё нет,
 инструкция установки PyTorch есть в `README.md`. Нужен работающий Python kernel;
 интерактивные панели не работают в статическом просмотрщике GitHub.
-""", "setup-help")
+""", 'setup-help')
 
-cell("code", """
+cell('code', r"""
 from pathlib import Path
 import os
 import sys
@@ -88,9 +125,10 @@ from qml_beans.seeds import StageConfig, export_study_config, make_study_config,
 torch.set_num_threads(1)
 print("Проект:", ROOT)
 print("PyTorch:", torch.__version__, "| PennyLane:", qml.__version__)
-""", "imports")
+from qml_beans.measurements import measurement_description
+""", 'imports')
 
-cell("markdown", """
+cell('markdown', r"""
 ## 1. Датасет
 
 Dry Bean скачивается с [UCI](https://archive.ics.uci.edu/dataset/602/dry+bean+dataset)
@@ -102,9 +140,9 @@ Dry Bean скачивается с [UCI](https://archive.ics.uci.edu/dataset/602
 Разбиение стратифицированное: сохраняются исходные доли классов, а не искусственные
 50/50. Для Sonar это 111 M / 97 R. В таблице ниже видны количества, проценты и
 отклонения после целочисленного округления; пересечение выборок запрещено.
-""", "dataset-help")
+""", 'dataset-help')
 
-cell("code", """
+cell('code', r"""
 dataset_choice = w.Dropdown(options=DATASETS, value=DATASETS[0], description="Датасет:", layout=w.Layout(width="400px"))
 data_path = w.Text(value="", description="Файл:", placeholder="data/my_dataset.csv", layout=w.Layout(width="650px"))
 target_column = w.Text(value="Class", description="Метка:")
@@ -113,9 +151,9 @@ validation_fraction = w.BoundedFloatText(value=0.15, min=0.01, max=0.8, step=0.0
 test_fraction = w.BoundedFloatText(value=0.20, min=0.01, max=0.8, step=0.01, description="Test доля:")
 deduplicate = w.Checkbox(value=True, description="Удалять точные дубликаты до разбиения", indent=False)
 display(w.VBox([dataset_choice, data_path, target_column, w.HBox([split_seed, validation_fraction, test_fraction]), deduplicate]))
-""", "dataset-controls")
+""", 'dataset-controls')
 
-cell("code", """
+cell('code', r"""
 # Загрузить данные / начать новый эксперимент с выбранными данными.
 source, prepared = select_dataset(
     ROOT, dataset_choice.value, path=data_path.value, target=target_column.value,
@@ -130,9 +168,9 @@ print("Удалено дубликатов:", prepared.metadata["duplicates_drop
 display(pd.DataFrame({"class": prepared.metadata["classes"], "count": np.bincount(prepared.y)}))
 display(class_distribution_table(prepared)[["split", "label", "count", "percent", "deviation_pp"]])
 print("Проверки разбиения:", {key: value for key, value in prepared.metadata["split_audit"].items() if key != "rows"})
-""", "load-data")
+""", 'load-data')
 
-cell("markdown", """
+cell('markdown', r"""
 ## 2. Классические блоки и квантовая схема
 
 У каждого скрытого слоя — своё число нейронов и активация. Проекция в **8 признаков**
@@ -148,18 +186,18 @@ cell("markdown", """
 `a<b`; `none` — без двухкубитных вентилей. Для RZ-кодирования включите начальные H,
 чтобы входные данные влияли на относительные фазы. Повторный ввод кодирует те же
 восемь признаков перед каждым следующим вариационным блоком.
-""", "architecture-help")
+""", 'architecture-help')
 
-cell("code", """
+cell('code', r"""
 pre_editor = LayerEditor("Скрытые слои ДО квантового блока", widths=(32,))
 post_editor = LayerEditor("Скрытые слои ПОСЛЕ квантового блока", widths=(16,))
 latent_activation = w.Dropdown(options=list(ACTIVATIONS), value="tanh", description="Активация → 8:", style={"description_width": "initial"})
 quantum_depth = w.BoundedIntText(value=2, min=1, max=50, description="Глубина:")
-embedding = w.Dropdown(options=["RX", "RY", "RZ"], value="RY", description="Кодирование:")
+embedding = w.Dropdown(options=["RX", "RY", "RZ"], value="RX", description="Кодирование:")
 rotations = w.Text(value="RY,RX", description="Вращения:", placeholder="RY,RZ,RX")
-topology = w.Dropdown(options=["ring", "linear", "full", "none", "custom"], value="ring", description="Связи:")
+topology = w.Dropdown(options=["ring", "linear", "full", "none", "custom"], value="linear", description="Связи:")
 entangler = w.Dropdown(options=["CNOT", "CZ"], value="CNOT", description="Вентиль:")
-edges = w.Textarea(value="[[0,1],[1,2],[2,3],[3,4],[4,5],[5,6],[6,7],[7,0]]", description="Custom:", layout=w.Layout(width="650px", height="70px"))
+edges = w.Textarea(value="[[0,1],[1,2],[2,3],[3,4],[4,5],[5,6],[6,7]]", description="Custom:", layout=w.Layout(width="650px", height="70px"))
 reupload = w.Checkbox(value=False, description="Повторный ввод данных в каждый блок", indent=False)
 hadamard = w.Checkbox(value=False, description="Начальные H на всех кубитах", indent=False)
 measurement = w.Dropdown(options=["X", "Y", "Z"], value="Z", description="Измерение:")
@@ -176,9 +214,25 @@ display(w.VBox([
     w.HBox([quantum_depth, embedding]), rotations, w.HBox([topology, entangler]),
     edges, reupload, hadamard, w.HBox([measurement, model_seed]),
 ]))
-""", "architecture-controls")
+measurement_shots = w.BoundedIntText(value=0, min=0, max=10000000, description="Измерений (shots):",
+    style={"description_width": "initial"}, tooltip="0 — аналитическое среднее; например, 1024 — среднее по 1024 измерениям на объект")
+measurement_seed = w.BoundedIntText(value=42, min=0, max=2**32-1, description="Seed измерений:",
+    style={"description_width": "initial"})
+display(w.HBox([measurement_shots, measurement_seed]))
+measurement_mode = w.Dropdown(options=[
+    ("Выборочные измерения + parameter-shift", "parameter_shift"),
+    ("Выборочный forward + аналитический Jacobian", "sampled_backprop"),
+    ("Аналитическое обучение, shots при оценке", "analytic_train"),
+], value="parameter_shift", description="Режим измерений:",
+   style={"description_width": "initial"}, layout=w.Layout(width="850px"))
+display(measurement_mode)
+display(w.HTML("<b>Выборочный forward + аналитический Jacobian:</b> реальные конечные измерения на входе "
+               "головы, быстрый суррогатный backprop. <br><b>Аналитическое обучение:</b> точные средние "
+               "при обучении; заданные shots при валидации и тестировании. <br>"
+               "0 shots сохраняет аналитический режим во всех случаях. Настройки применяются при создании модели."))
+""", 'architecture-controls')
 
-cell("code", """
+cell('code', r"""
 # СОЗДАТЬ НОВУЮ МОДЕЛЬ. Повторное выполнение сбрасывает веса, но не удаляет сохранённые запуски.
 pre_widths, pre_activations = pre_editor.values()
 post_widths, post_activations = post_editor.values()
@@ -191,6 +245,8 @@ config = ModelConfig(
     entanglement=topology.value, entangler=entangler.value,
     custom_edges=parse_edges(edges.value) if topology.value == "custom" else (),
     reupload=reupload.value, initial_hadamard=hadamard.value, measurement=measurement.value,
+    shots=measurement_shots.value or None, measurement_seed=measurement_seed.value,
+    measurement_mode=measurement_mode.value,
 )
 model = experiment.build(config, seed=model_seed.value)
 print(model)
@@ -198,16 +254,17 @@ print("Полносвязных слоёв:", sum(isinstance(layer, torch.nn.Lin
 print("Всего параметров:", sum(p.numel() for p in model.parameters()))
 print("Квантовых параметров:", model.quantum.weights.numel())
 display(pd.Series(model.config_dict(), name="Созданная архитектура").to_frame())
-""", "build-model")
+print("Измерение:", measurement_description(config))
+""", 'build-model')
 
-cell("markdown", """
+cell('markdown', r"""
 ### Схема созданной модели
 
 Рисунок показывает фактический QNode; после изменения настроек сначала создайте модель заново.
 Он остаётся доступен и при выборе обхода квантового блока в режиме обучения.
-""", "circuit-help")
+""", 'circuit-help')
 
-cell("code", """
+cell('code', r"""
 with plt.rc_context({
     "font.family": "Times New Roman",
     "mathtext.fontset": "custom",
@@ -226,7 +283,7 @@ with plt.rc_context({
         for text in ax.texts:
             text.set_fontfamily("Times New Roman")
             if text.get_text() in {str(wire) for wire in range(8)}:
-                text.set_text(r"$|0\\rangle$")
+                text.set_text(r"$|0\rangle$")
             if text.get_text() in {"RX", "RY", "RZ", "H", "CNOT", "CZ", "X", "Y", "Z"}:
                 text.set_fontweight("bold")
     display(figure)
@@ -235,9 +292,9 @@ with plt.rc_context({
     figure.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Сохранено: {output_path}")
     plt.close(figure)
-""", "draw-circuit")
+""", 'draw-circuit')
 
-cell("markdown", """
+cell('markdown', r"""
 ## 3. Обучение текущей модели
 
 Три переключателя независимы. Если схема выключена, используется обход `8 → 8`;
@@ -252,18 +309,18 @@ cell("markdown", """
 
 После каждого этапа в памяти остаются его лучшие веса по val loss. Каждый этап
 использует новый Adam и новую папку результатов. Менять learning rate между этапами можно.
-""", "training-help")
+""", 'training-help')
 
-cell("code", """
-preset = w.Dropdown(options=["Вручную", "1. Классика без схемы", "2. Только квантовая", "3. Совместное", "Классика с фиксированной схемой"], value="Вручную", description="Режим:", layout=w.Layout(width="450px"))
+cell('code', r"""
+preset = w.Dropdown(options=["Вручную", "1. Классика без схемы", "2. Только квантовая", "3. Совместное", "Классика с фиксированной схемой"], value="3. Совместное", description="Режим:", layout=w.Layout(width="450px"))
 use_quantum = w.Checkbox(value=True, description="Есть квантовый блок", indent=False)
 train_classical = w.Checkbox(value=True, description="Классика обучается", indent=False)
 train_quantum = w.Checkbox(value=True, description="Квантовая обучается", indent=False)
-epochs = w.BoundedIntText(value=3, min=1, max=10000, description="Эпох:")
+epochs = w.BoundedIntText(value=100, min=1, max=10000, description="Эпох:")
 batch_size = w.BoundedIntText(value=64, min=1, max=2048, description="Batch size:")
 learning_rate = w.BoundedFloatText(value=0.001, min=1e-8, max=1, step=0.0001, description="LR классики:")
 quantum_learning_rate = w.BoundedFloatText(value=0.001, min=1e-8, max=1, step=0.0001, description="LR схемы:")
-patience = w.BoundedIntText(value=7, min=0, max=10000, description="Patience:")
+patience = w.BoundedIntText(value=100, min=0, max=10000, description="Patience:")
 training_seed = w.IntText(value=42, description="Seed этапа:")
 
 def apply_preset(change):
@@ -280,9 +337,9 @@ preset.observe(apply_preset, names="value")
 display(w.VBox([preset, w.HBox([use_quantum, train_classical, train_quantum]),
                 w.HBox([epochs, batch_size, patience]),
                 w.HBox([learning_rate, quantum_learning_rate, training_seed])]))
-""", "training-controls")
+""", 'training-controls')
 
-cell("code", """
+cell('code', r"""
 # ЗАПУСТИТЬ ЭТАП. Повторяйте эту ячейку для продолжения с текущими лучшими весами.
 result = experiment.train_stage(
     quantum=use_quantum.value, train_classical=train_classical.value, train_quantum=train_quantum.value,
@@ -294,9 +351,9 @@ plot_run(result)
 display(experiment.comparison())
 report = result["metrics"]["test"]["classification_report"]
 display(pd.DataFrame({key: value for key, value in report.items() if isinstance(value, dict)}).T)
-""", "train-stage")
+""", 'train-stage')
 
-cell("markdown", """
+cell('markdown', r"""
 ## 4. Несколько seed: среднее, разброс и интервал среднего
 
 ### Необязательная Stratified k-fold кросс-валидация
@@ -357,9 +414,9 @@ seed и протокол; не отбирайте лучший seed и не по
 Запуски внутри пакета выполняются последовательно. Можно дополнять ту же папку
 новыми seed в другой сессии или собирать совместимые отдельные папки ниже.
 Повторные seed не считаются новыми наблюдениями; несовместимые протоколы не смешиваются.
-""", "seeds-help")
+""", 'seeds-help')
 
-cell("code", """
+cell('code', r"""
 study_seeds = w.Text(value="11,22,33,44,55", description="Seeds:", layout=w.Layout(width="550px"))
 study_cv = w.Checkbox(value=False, description="Stratified k-fold кросс-валидация", indent=False)
 study_k = w.BoundedIntText(value=5, min=2, max=20, description="k фолдов:")
@@ -370,7 +427,7 @@ study_classical_epochs = w.BoundedIntText(value=20, min=1, max=10000, descriptio
 study_quantum_epochs = w.BoundedIntText(value=5, min=1, max=10000, description="Квантовая эпох:", style={"description_width": "initial"})
 study_joint_epochs = w.BoundedIntText(value=20, min=1, max=10000, description="Совместно эпох:", style={"description_width": "initial"})
 study_joint_lr = w.BoundedFloatText(value=0.0003, min=1e-8, max=1, step=0.0001, description="Joint LR:")
-study_output = w.Text(value="runs/seed_study", description="Папка серии:", style={"description_width": "initial"}, layout=w.Layout(width="750px"))
+study_output = w.Text(value="runs/seed_study_sonar_kfold_", description="Папка серии:", style={"description_width": "initial"}, layout=w.Layout(width="750px"))
 study_band = w.Dropdown(options=[("Среднее ± SD", "sd"), ("Среднее ± 95% t-CI", "ci95")], value="sd", description="Полоса:")
 study_skip = w.Checkbox(value=True, description="Пропускать уже завершённые seed", indent=False)
 study_run = w.Checkbox(value=False, description="Обучить указанные seed при выполнении следующей ячейки", indent=False)
@@ -384,9 +441,9 @@ study_policy.observe(update_study_policy, names="value")
 display(w.VBox([study_seeds, study_cv, w.HBox([study_k, study_cv_val]), study_policy, study_protocol,
                 w.HBox([study_classical_epochs, study_quantum_epochs, study_joint_epochs]),
                 study_joint_lr, study_output, study_band, study_skip, study_run]))
-""", "seeds-controls")
+""", 'seeds-controls')
 
-cell("code", """
+cell('code', r"""
 # Конфигурация всегда экспортируется; обучение выполняется только при включённом флажке.
 from datetime import datetime
 selected_seeds = parse_seeds(study_seeds.value)
@@ -438,29 +495,29 @@ if study_run.value:
     display(seed_report["summary"])
     if "fold_summary" in seed_report:
         display(seed_report["fold_summary"])
-    print("\\n".join(seed_report["statements"]))
+    print("\n".join(seed_report["statements"]))
 else:
     print("Обучение серии выключено. Для запуска включите флажок выше и повторите эту ячейку.")
     print("Отдельный запуск одного seed из терминала (замените seed и папку при необходимости):")
     print(f'"{sys.executable}" scripts/run_seeds.py run --config "{config_file}" --seeds {selected_seeds[0]} --output "{study_folder}"')
-""", "run-seeds")
+""", 'run-seeds')
 
-cell("markdown", """
+cell('markdown', r"""
 ### Собрать отдельные запуски без повторного обучения
 
 Укажите по одной папке серии или завершённого seed на строку. Можно собрать seed,
 обученные в отдельных папках с одной экспортированной конфигурацией. Таблицы и
 графики пересоздаются по сохранённым результатам; обучение не запускается.
 Пустое поле пропускает сборку. Для другой величины полосы используйте переключатель выше.
-""", "collect-help")
+""", 'collect-help')
 
-cell("code", """
-collect_paths = w.Textarea(value="", description="Папки:", placeholder="runs/seed_study\\nruns/seed_study_other", layout=w.Layout(width="750px", height="90px"))
+cell('code', r"""
+collect_paths = w.Textarea(value="", description="Папки:", placeholder="runs/seed_study\nruns/seed_study_other", layout=w.Layout(width="750px", height="90px"))
 collect_output = w.Text(value="runs/seed_collected", description="Отчёт:", layout=w.Layout(width="750px"))
 display(w.VBox([collect_paths, collect_output]))
-""", "collect-controls")
+""", 'collect-controls')
 
-cell("code", """
+cell('code', r"""
 if collect_paths.value.strip():
     inputs = [Path(line.strip()).expanduser() for line in collect_paths.value.splitlines() if line.strip()]
     inputs = [path if path.is_absolute() else ROOT / path for path in inputs]
@@ -472,12 +529,12 @@ if collect_paths.value.strip():
     display(collected["summary"])
     if "fold_summary" in collected:
         display(collected["fold_summary"])
-    print("\\n".join(collected["statements"]))
+    print("\n".join(collected["statements"]))
 else:
     print("Папки не указаны — сборка пропущена.")
-""", "collect-seeds")
+""", 'collect-seeds')
 
-cell("markdown", """
+cell('markdown', r"""
 ## 5. Продолжить с сохранённых весов
 
 Укажите `best.pt` или `last.pt` и выполните следующую ячейку. Датасет выше должен
@@ -486,19 +543,22 @@ cell("markdown", """
 значения панелей создания модели при этом не применяются.
 После загрузки выбирайте режим в секции 3 и повторяйте ячейку запуска этапа.
 Пустой путь оставляет текущую модель без изменений.
-""", "checkpoint-help")
+""", 'checkpoint-help')
 
-cell("code", """
+cell('code', r"""
 checkpoint_path = w.Text(value="", description="Checkpoint:", placeholder="runs/demo/classical/best.pt", layout=w.Layout(width="800px"))
 display(checkpoint_path)
-""", "checkpoint-control")
+""", 'checkpoint-control')
 
-cell("code", """
+cell('code', r"""
 if checkpoint_path.value.strip():
     checkpoint_file = Path(checkpoint_path.value).expanduser()
     if not checkpoint_file.is_absolute():
         checkpoint_file = ROOT / checkpoint_file
     experiment.restore(checkpoint_file)
+    measurement_mode.value = experiment.model.config.measurement_mode
+    measurement_shots.value = experiment.model.config.shots or 0
+    measurement_seed.value = experiment.model.config.measurement_seed
     mode = experiment.model.mode_dict()
     preset.value = "Вручную"
     use_quantum.value = mode["quantum"]
@@ -509,9 +569,9 @@ if checkpoint_path.value.strip():
     display(pd.Series(experiment.model.config_dict(), name="Восстановленная архитектура").to_frame())
 else:
     print("Путь не указан — используется текущая модель.")
-""", "restore-checkpoint")
+""", 'restore-checkpoint')
 
-cell("markdown", """
+cell('markdown', r"""
 ## 6. Конфигурация и предсказания
 
 Полная конфигурация сохраняется в каждом `best.pt` и `metrics.json`.
@@ -525,15 +585,15 @@ cell("markdown", """
 Связи задаются `entanglement="custom", custom_edges=((0,1),(0,3),(3,7))`.
 Настройки квантового блока описывают повторяемый вариационный блок; для произвольной
 последовательности других вентилей редактируйте `QuantumBlock` в `src/qml_beans/model.py`.
-""", "exports-help")
+""", 'exports-help')
 
-cell("code", """
+cell('code', r"""
 print(json.dumps(experiment.model.config_dict(), ensure_ascii=False, indent=2))
 prediction_path = w.Text(value="", description="Новые данные:", placeholder="data/new_beans.csv", style={"description_width": "initial"}, layout=w.Layout(width="800px"))
 display(prediction_path)
-""", "prediction-control")
+""", 'prediction-control')
 
-cell("code", """
+cell('code', r"""
 if prediction_path.value.strip():
     new_file = Path(prediction_path.value).expanduser()
     if not new_file.is_absolute():
@@ -548,9 +608,9 @@ if prediction_path.value.strip():
     # При необходимости: predictions.to_csv(ROOT / "runs" / "predictions.csv", index=False)
 else:
     print("Для предсказаний укажите файл в поле выше и повторите эту ячейку.")
-""", "predict-new")
+""", 'predict-new')
 
-cell("markdown", """
+cell('markdown', r"""
 Данные Dry Bean: *Dry Bean [Dataset]* (2020), UCI,
 [DOI 10.24432/C50S4B](https://doi.org/10.24432/C50S4B), CC BY 4.0.
 Данные Sonar: Sejnowski, T. & Gorman, R. (1988), *Connectionist Bench (Sonar, Mines vs. Rocks)*,
@@ -559,7 +619,7 @@ cell("markdown", """
 Стратифицированная CV: [scikit-learn](https://scikit-learn.org/stable/modules/cross_validation.html).
 Документация: [PennyLane + PyTorch](https://docs.pennylane.ai/en/stable/introduction/interfaces/torch.html),
 [Jupyter Widgets](https://ipywidgets.readthedocs.io/en/stable/).
-""", "references")
+""", 'references')
 
 
 if __name__ == "__main__":

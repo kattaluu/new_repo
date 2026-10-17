@@ -117,6 +117,10 @@ def _validate_config(config):
                                  split_policy=config["split_policy"], split_seed=config["split_seed"],
                                  val_size=config["val_size"], test_size=config["test_size"],
                                  cv_folds=config.get("cv_folds", 0))
+    # Old analytic manifests predate the optional shot settings; retain their identity.
+    for field in ("shots", "measurement_seed", "measurement_mode"):
+        if field not in config["model_config"]:
+            rebuilt["model_config"].pop(field, None)
     if study_id(rebuilt) != study_id(config):
         raise ValueError("Study source, configuration or library versions changed; create a new study")
 
@@ -252,7 +256,7 @@ def collect_seed_runs(paths):
             if (metrics["run_config"].get("study_id") != identity or
                     metrics["run_config"]["seed"] != seed or
                     metrics["run_config"].get("split_seed") != expected_split_seed or
-                    metrics["model_config"] != config["model_config"] or
+                    ModelConfig(**metrics["model_config"]) != ModelConfig(**config["model_config"]) or
                     metadata["fingerprint"] != config["dataset_fingerprint"] or
                     metadata["seed"] != expected_split_seed or
                     metadata["target"] != config["target"] or

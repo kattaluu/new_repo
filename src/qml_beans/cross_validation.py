@@ -8,6 +8,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, log_loss
 
 from .data import audit_splits
+from .model import ModelConfig
 from .training import write_json
 
 
@@ -79,7 +80,7 @@ def read_cv_run(config, saved, record, split_seed):
                     metrics["run_config"]["seed"] != saved["seed"] or
                     metrics["run_config"].get("split_seed") != split_seed or
                     metrics["run_config"].get("fold") != fold_index or
-                    metrics["model_config"] != config["model_config"] or
+                    ModelConfig(**metrics["model_config"]) != ModelConfig(**config["model_config"]) or
                     metadata["fingerprint"] != config["dataset_fingerprint"] or
                     metadata["seed"] != split_seed or metadata["fold"] != fold_index or
                     metadata["n_splits"] != config["cv_folds"] or

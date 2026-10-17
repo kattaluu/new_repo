@@ -3,8 +3,12 @@
 from dataclasses import asdict, dataclass
 
 import pennylane as qml
+import numpy as np
 import torch
 from torch import nn
+
+from .measurements import (MEASUREMENT_MODES, effective_shots, readout_with_analytic_jacobian,
+                           rotate_measurement_basis)
 
 
 ACTIVATIONS = {
@@ -36,8 +40,17 @@ class ModelConfig:
     reupload: bool = False
     initial_hadamard: bool = False
     measurement: str = "Z"
+    shots: int | None = None
+    measurement_seed: int = 42
+    measurement_mode: str = "parameter_shift"
 
     def __post_init__(self):
+        if self.measurement_mode not in MEASUREMENT_MODES:
+            raise ValueError(f"measurement_mode must be one of {MEASUREMENT_MODES}")
+        if self.shots is not None and (type(self.shots) is not int or self.shots < 1):
+            raise ValueError("shots must be None (analytic) or a positive integer")
+        if type(self.measurement_seed) is not int or not 0 <= self.measurement_seed < 2**32:
+            raise ValueError("measurement_seed must be an integer in 0..2**32-1")
         if self.n_qubits != 8:
             raise ValueError("This architecture requires exactly 8 qubits.")
         if min(self.n_features, self.pre_hidden, self.post_hidden, self.quantum_depth) < 1:
@@ -113,13 +126,17 @@ def dense_block(n_inputs, widths, activations, n_outputs, output_activation=None
 
 
 class QuantumBlock(nn.Module):
-    """Batched analytic state vector (256 amplitudes), differentiable in inputs and weights."""
+    """State vector with analytic, parameter-shift or sampled-forward/backprop readout."""
 
     def __init__(self, depth: int, config: ModelConfig | None = None):
         super().__init__()
         config = config or ModelConfig(8, 2, quantum_depth=depth)
+        self.config = config
+        self.shots = config.shots
+        self.sampling_rng = np.random.default_rng(config.measurement_seed)
+        self.backprop_sampling_rng = torch.Generator().manual_seed(config.measurement_seed)
         self.weights = nn.Parameter(0.05 * torch.randn(depth, 8, len(config.rotation_gates)))
-        device = qml.device("default.qubit", wires=8, shots=None)
+        device = qml.device("default.qubit", wires=8, seed=self.sampling_rng)
         rotation_ops = {"RX": qml.RX, "RY": qml.RY, "RZ": qml.RZ}
         observable = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}[config.measurement]
         entangler = {"CNOT": qml.CNOT, "CZ": qml.CZ}[config.entangler]
@@ -128,8 +145,7 @@ class QuantumBlock(nn.Module):
             for wire in range(8):
                 rotation_ops[config.embedding](torch.pi * inputs[..., wire], wires=wire)
 
-        @qml.qnode(device, interface="torch", diff_method="backprop")
-        def circuit(inputs, weights):
+        def operations(inputs, weights):
             if config.initial_hadamard:
                 for wire in range(8):
                     qml.Hadamard(wires=wire)
@@ -142,12 +158,36 @@ class QuantumBlock(nn.Module):
                         rotation_ops[gate](weights[layer, wire, gate_index], wires=wire)
                 for edge in config.edges():
                     entangler(wires=edge)
+
+        strict_shots = bool(self.shots and config.measurement_mode == "parameter_shift")
+
+        @qml.qnode(device, interface="torch", diff_method="parameter-shift" if strict_shots else "backprop")
+        def circuit(inputs, weights):
+            operations(inputs, weights)
             return tuple(qml.expval(observable(wire)) for wire in range(8))
 
-        self.circuit = circuit
+        self.circuit = qml.set_shots(circuit, shots=self.shots) if strict_shots else circuit
+
+        @qml.qnode(qml.device("default.qubit", wires=8, seed=self.sampling_rng), interface="torch", diff_method="backprop")
+        def probability_circuit(inputs, weights):
+            operations(inputs, weights)
+            rotate_measurement_basis(config.measurement)
+            return qml.probs(wires=range(8))
+
+        self.probability_circuit = probability_circuit
+
+    def set_measurement_seed(self, seed):
+        self.sampling_rng.bit_generator.state = np.random.default_rng(seed).bit_generator.state
+        self.backprop_sampling_rng.manual_seed(seed)
 
     def forward(self, inputs):
         # PennyLane uses double precision internally; keep the classical model's dtype.
+        if effective_shots(self.config, self.training) and self.config.measurement_mode != "parameter_shift":
+            probabilities = self.probability_circuit(inputs, self.weights)
+            return readout_with_analytic_jacobian(probabilities, self.shots, self.backprop_sampling_rng).to(inputs.dtype)
+        if self.shots and self.config.measurement_mode == "parameter_shift":
+            # Finite-shot parameter-shift must see individual tapes, not broadcasted inputs.
+            return torch.stack([torch.stack(self.circuit(row, self.weights)) for row in inputs]).to(inputs.dtype)
         return torch.stack(self.circuit(inputs, self.weights), dim=-1).to(inputs.dtype)
 
 
