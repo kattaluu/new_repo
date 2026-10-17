@@ -50,6 +50,7 @@ def test_compiled_gates_fidelity_and_local_rng():
 
 @pytest.mark.parametrize('topology,entangler,measurement', [
     ('linear', 'CNOT', 'Z'), ('brickwork', 'CNOT', 'X'), ('brickwork', 'CZ', 'Y'),
+    ('brickwork3', 'CNOT', 'X'), ('brickwork3', 'CZ', 'Y'),
 ])
 def test_compiled_density_matches_pennylane_and_statevector(topology, entangler, measurement):
     config = ModelConfig(8, 2, quantum_depth=2, reupload=True, initial_hadamard=True,

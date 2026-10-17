@@ -62,7 +62,7 @@ class NoiseConfig:
 
 
 def circuit_schedule(config, noise):
-    """Parallel one-qubit moments; serial entanglers except two parallel brickwork rows.
+    """Parallel one-qubit moments; serial entanglers except parallel brickwork rows.
 
     Noise is applied after each ideal moment (gate-level, zero-temperature Markov model).
     A virtual RZ is not assumed: every configured rotation has single_gate_us duration.
@@ -76,8 +76,12 @@ def circuit_schedule(config, noise):
             operations.append(("embed", None, noise.single_gate_us))
         for gate_index, gate in enumerate(config.rotation_gates):
             operations.append((gate, (layer, gate_index), noise.single_gate_us))
-        if config.entanglement == "brickwork":
-            for edges in (config.edges()[:4], config.edges()[4:]):
+        if config.entanglement in ("brickwork", "brickwork3"):
+            all_edges = config.edges()
+            rows = (all_edges[:4], all_edges[4:7])
+            if config.entanglement == "brickwork3":
+                rows += (all_edges[7:],)
+            for edges in rows:
                 operations.append((config.entangler + "_parallel", edges, noise.two_gate_us))
         else:
             for edge in config.edges():

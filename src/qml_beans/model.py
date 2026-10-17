@@ -78,9 +78,9 @@ class ModelConfig:
             raise ValueError("RZ encoding needs initial Hadamard gates to encode data in relative phases")
         if not self.rotation_gates or any(gate not in ("RX", "RY", "RZ") for gate in self.rotation_gates):
             raise ValueError("Choose a nonempty ordered sequence of RX / RY / RZ rotations")
-        if self.entanglement not in ("ring", "linear", "brickwork", "full", "none", "custom"):
+        if self.entanglement not in ("ring", "linear", "brickwork", "brickwork3", "full", "none", "custom"):
             raise ValueError(f"Unsupported entanglement topology: {self.entanglement!r}. "
-                             "Choose ring, linear, brickwork, full, none or custom")
+                             "Choose ring, linear, brickwork, brickwork3, full, none or custom")
         if self.entangler not in ("CNOT", "CZ") or self.measurement not in ("X", "Y", "Z"):
             raise ValueError("Entangler must be CNOT/CZ and measurement must be X/Y/Z")
         for edge in self.custom_edges:
@@ -106,8 +106,10 @@ class ModelConfig:
         return self.post_activations if self.post_activations is not None else ("relu",) * len(self.head_widths)
 
     def edges(self):
-        if self.entanglement == "brickwork":
-            return ((0, 1), (2, 3), (4, 5), (6, 7), (1, 2), (3, 4), (5, 6))
+        if self.entanglement in ("brickwork", "brickwork3"):
+            even = ((0, 1), (2, 3), (4, 5), (6, 7))
+            odd = ((1, 2), (3, 4), (5, 6))
+            return even + odd + (even if self.entanglement == "brickwork3" else ())
         if self.entanglement == "ring":
             return tuple((wire, (wire + 1) % 8) for wire in range(8))
         if self.entanglement == "linear":

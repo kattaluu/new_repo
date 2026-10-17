@@ -21,7 +21,7 @@ from qml_beans.noisy import NoiseConfig, NoisyHybridClassifier
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--backend', choices=['torch_density', 'pennylane_mixed', 'pennylane_statevector'], default='torch_density')
-    parser.add_argument('--topology', choices=['linear', 'brickwork', 'ring'], default='brickwork')
+    parser.add_argument('--topology', choices=['linear', 'brickwork', 'brickwork3', 'ring'], default='brickwork')
     parser.add_argument('--depth', type=int, default=2)
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--repeats', type=int, default=7)

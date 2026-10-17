@@ -188,14 +188,16 @@ def test_read_idx_and_invalid_noise(tmp_path):
 
 
 @pytest.mark.parametrize("entangler", ["CNOT", "CZ"])
-def test_brickwork_parallel_rows_physics_and_gradients(entangler):
+@pytest.mark.parametrize("topology", ["brickwork", "brickwork3"])
+def test_brickwork_parallel_rows_physics_and_gradients(entangler, topology):
     from qml_beans.noisy import circuit_schedule
 
-    config = ModelConfig(8, 2, quantum_depth=1, entanglement="brickwork", entangler=entangler)
+    config = ModelConfig(8, 2, quantum_depth=1, entanglement=topology, entangler=entangler)
     noise = NoiseConfig(single_gate_us=0.05, two_gate_us=0.3, precision="float64")
     rows = [step for step in circuit_schedule(config, noise) if step[0].endswith("_parallel")]
-    assert [row[1] for row in rows] == [((0, 1), (2, 3), (4, 5), (6, 7)), ((1, 2), (3, 4), (5, 6))]
-    assert sum(step[2] for step in circuit_schedule(config, noise)) == pytest.approx(0.75)
+    even, odd = ((0, 1), (2, 3), (4, 5), (6, 7)), ((1, 2), (3, 4), (5, 6))
+    assert [row[1] for row in rows] == [even, odd] + ([even] if topology == "brickwork3" else [])
+    assert sum(step[2] for step in circuit_schedule(config, noise)) == pytest.approx(1.05 if topology == "brickwork3" else 0.75)
     custom = TorchDensityBlock(config, noise).double()
     reference = PennyLaneMixedBlock(config, noise).double()
     reference.weights.data.copy_(custom.weights)

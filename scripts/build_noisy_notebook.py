@@ -175,7 +175,7 @@ post_editor = LayerEditor("Слои после квантовой части", (
 depth = w.BoundedIntText(value=2, min=1, max=20, description="Квант. слоёв:")
 embedding = w.Dropdown(options=["RY", "RX", "RZ"], value="RX", description="Кодирование:")
 rotations = w.Text(value="RY,RX", description="Вращения:")
-topology = w.Dropdown(options=[ ("Линия", "linear"), ("Два ряда", "brickwork"),("Кольцо", "ring"), ("Полная", "full"), ("Без связей", "none"), ("Свои связи", "custom")], description="Связи:")
+topology = w.Dropdown(options=[ ("Линия", "linear"), ("Два ряда", "brickwork"), ("Три ряда: чётные–нечётные–чётные", "brickwork3"),("Кольцо", "ring"), ("Полная", "full"), ("Без связей", "none"), ("Свои связи", "custom")], description="Связи:")
 custom_edges = w.Text(value="[[0,1],[1,2],[2,7]]", description="Свои связи:", layout=w.Layout(width="650px"))
 entangler = w.Dropdown(options=["CNOT", "CZ"], description="Вентиль:")
 measurement = w.Dropdown(options=["Z", "X", "Y"], description="Измерение:")

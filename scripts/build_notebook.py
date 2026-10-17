@@ -195,7 +195,7 @@ latent_activation = w.Dropdown(options=list(ACTIVATIONS), value="tanh", descript
 quantum_depth = w.BoundedIntText(value=2, min=1, max=50, description="Глубина:")
 embedding = w.Dropdown(options=["RX", "RY", "RZ"], value="RX", description="Кодирование:")
 rotations = w.Text(value="RY,RX", description="Вращения:", placeholder="RY,RZ,RX")
-topology = w.Dropdown(options=["ring", "linear", "brickwork", "full", "none", "custom"], value="linear", description="Связи:")
+topology = w.Dropdown(options=["ring", "linear", "brickwork", "brickwork3", "full", "none", "custom"], value="linear", description="Связи:")
 entangler = w.Dropdown(options=["CNOT", "CZ"], value="CNOT", description="Вентиль:")
 edges = w.Textarea(value="[[0,1],[1,2],[2,3],[3,4],[4,5],[5,6],[6,7]]", description="Custom:", layout=w.Layout(width="650px", height="70px"))
 reupload = w.Checkbox(value=False, description="Повторный ввод данных в каждый блок", indent=False)
