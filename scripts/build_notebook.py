@@ -232,6 +232,21 @@ display(w.HTML("<b>Выборочный forward + аналитический Jac
                "0 shots сохраняет аналитический режим во всех случаях. Настройки применяются при создании модели."))
 """, 'architecture-controls')
 
+cell('markdown', r"""
+### Обучаемое кодирование
+
+Угол RX/RY/RZ-кодирования: $\pi a_i z_i$, где $a_i$ — обучаемый масштаб кубита,
+изначально равный 1. Добавляется 8 параметров квантовой части, общих для всех
+повторных кодирований. Они обучаются и замораживаются вместе с квантовой частью.
+Выключение опции сохраняет прежнее кодирование.
+""", 'embedding-scale-help')
+
+cell('code', r"""
+trainable_embedding = w.Checkbox(value=True, description="Обучаемый масштаб кодирования",
+    style={"description_width": "initial"}, layout=w.Layout(width="500px"))
+display(trainable_embedding)
+""", 'embedding-scale-control')
+
 cell('code', r"""
 # СОЗДАТЬ НОВУЮ МОДЕЛЬ. Повторное выполнение сбрасывает веса, но не удаляет сохранённые запуски.
 pre_widths, pre_activations = pre_editor.values()
@@ -242,6 +257,7 @@ config = ModelConfig(
     pre_activations=pre_activations, post_activations=post_activations,
     latent_activation=latent_activation.value, quantum_depth=quantum_depth.value,
     embedding=embedding.value, rotation_gates=parse_rotations(rotations.value),
+    trainable_embedding=trainable_embedding.value,
     entanglement=topology.value, entangler=entangler.value,
     custom_edges=parse_edges(edges.value) if topology.value == "custom" else (),
     reupload=reupload.value, initial_hadamard=hadamard.value, measurement=measurement.value,
@@ -559,6 +575,7 @@ if checkpoint_path.value.strip():
     measurement_mode.value = experiment.model.config.measurement_mode
     measurement_shots.value = experiment.model.config.shots or 0
     measurement_seed.value = experiment.model.config.measurement_seed
+    trainable_embedding.value = experiment.model.config.trainable_embedding
     mode = experiment.model.mode_dict()
     preset.value = "Вручную"
     use_quantum.value = mode["quantum"]

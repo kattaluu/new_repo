@@ -138,6 +138,7 @@ class TorchDensityBlock(nn.Module):
         super().__init__()
         self.config, self.noise = config, noise
         self.weights = nn.Parameter(0.05 * torch.randn(config.quantum_depth, 8, len(config.rotation_gates)))
+        self.register_parameter("embedding_scale", nn.Parameter(torch.ones(8)) if config.trainable_embedding else None)
         self.schedule = circuit_schedule(config, noise)
         self.gate_errors = compile_gate_errors(noise)
         if self.gate_errors:
@@ -176,6 +177,11 @@ class TorchDensityBlock(nn.Module):
         self.sampling_rng.manual_seed(seed)
 
     def density_matrix(self, inputs, weights=None, shift=None):
+        if self.embedding_scale is not None:
+            inputs = inputs * self.embedding_scale
+        return self._density_matrix_encoded(inputs, weights, shift)
+
+    def _density_matrix_encoded(self, inputs, weights=None, shift=None):
         weights = self.weights if weights is None else weights
         dtype = torch.complex128 if inputs.dtype == torch.float64 else torch.complex64
         ket = torch.zeros((inputs.shape[0], 256), dtype=dtype, device=inputs.device)
@@ -226,7 +232,7 @@ class TorchDensityBlock(nn.Module):
         return rho
 
     def _measure(self, inputs, weights=None, shift=None):
-        rho = self.density_matrix(inputs, weights, shift)
+        rho = self._density_matrix_encoded(inputs, weights, shift)
         if self.config.measurement == "X":
             h = inputs.new_tensor([[1, 1], [1, -1]]).to(rho.dtype) / math.sqrt(2)
             for wire in range(8):
@@ -249,6 +255,8 @@ class TorchDensityBlock(nn.Module):
         return mean
 
     def forward(self, inputs):
+        if self.embedding_scale is not None:
+            inputs = inputs * self.embedding_scale
         if self.config.shots and self.config.measurement_mode == "parameter_shift":
             return _ShotParameterShift.apply(inputs, self.weights, self)
         return self._measure(inputs)
@@ -297,6 +305,7 @@ class PennyLaneMixedBlock(nn.Module):
         self.sampling_rng = np.random.default_rng(config.measurement_seed)
         self.backprop_sampling_rng = torch.Generator().manual_seed(config.measurement_seed)
         self.weights = nn.Parameter(0.05 * torch.randn(config.quantum_depth, 8, len(config.rotation_gates)))
+        self.register_parameter("embedding_scale", nn.Parameter(torch.ones(8)) if config.trainable_embedding else None)
         rotations = {"RX": qml.RX, "RY": qml.RY, "RZ": qml.RZ}
         observable = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}[config.measurement]
         schedule = circuit_schedule(config, noise)
@@ -352,6 +361,8 @@ class PennyLaneMixedBlock(nn.Module):
         self.backprop_sampling_rng.manual_seed(seed)
 
     def forward(self, inputs):
+        if self.embedding_scale is not None:
+            inputs = inputs * self.embedding_scale
         if effective_shots(self.config, self.training) and self.config.measurement_mode != "parameter_shift":
             probabilities = self.probability_circuit(inputs, self.weights)
             return readout_with_analytic_jacobian(probabilities, self.shots, self.backprop_sampling_rng).to(inputs.dtype)

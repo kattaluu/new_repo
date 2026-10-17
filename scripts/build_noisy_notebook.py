@@ -255,6 +255,22 @@ gate_error_seed = w.BoundedIntText(value=42, min=0, max=2**32-1,
 display(w.VBox([gate_errors_on, single_fidelity, two_fidelity, gate_error_seed]))
 """, 'gate-errors-controls')
 
+cell('markdown', r"""
+### Обучаемое кодирование
+
+Угол кодирования: $\pi a_i z_i$, где $z_i$ — выход энкодера, а $a_i$ — отдельный
+обучаемый масштаб для каждого из 8 кубитов. Изначально $a_i=1$, то есть схема
+совпадает с прежней. Масштабы относятся к квантовой части и замораживаются её
+переключателем обучения; при повторном кодировании используются те же 8 масштабов.
+Поддерживаются RX, RY и RZ. Выключение опции сохраняет прежнее кодирование.
+""", 'embedding-scale-help')
+
+cell('code', r"""
+trainable_embedding = w.Checkbox(value=True, description="Обучаемый масштаб кодирования",
+    style={"description_width": "initial"}, layout=w.Layout(width="500px"))
+display(trainable_embedding)
+""", 'embedding-scale-control')
+
 cell('code', r"""
 # Обновить классы после изменений кода без перезапуска ядра Jupyter.
 import importlib
@@ -284,7 +300,7 @@ post_widths, post_activations = post_editor.values()
 model_config = ModelConfig(n_features=data.train_x.shape[1], n_classes=10,
     pre_layers=pre_widths, pre_activations=pre_activations,
     post_layers=post_widths, post_activations=post_activations,
-    quantum_depth=depth.value, embedding=embedding.value,
+    quantum_depth=depth.value, embedding=embedding.value, trainable_embedding=trainable_embedding.value,
     rotation_gates=tuple(g.strip().upper() for g in rotations.value.split(",") if g.strip()),
     entanglement=topology.value, custom_edges=parse_edges(custom_edges.value),
     entangler=entangler.value, measurement=measurement.value,
@@ -489,6 +505,7 @@ if checkpoint_path:
     measurement_mode.value = model_config.measurement_mode
     measurement_shots.value = model_config.shots or 0
     measurement_seed.value = model_config.measurement_seed
+    trainable_embedding.value = model_config.trainable_embedding
     use_quantum.value = model.use_quantum
     train_classical.value = model.train_classical
     train_quantum.value = model.train_quantum

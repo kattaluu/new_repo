@@ -43,8 +43,11 @@ class ModelConfig:
     shots: int | None = None
     measurement_seed: int = 42
     measurement_mode: str = "parameter_shift"
+    trainable_embedding: bool = False
 
     def __post_init__(self):
+        if type(self.trainable_embedding) is not bool:
+            raise ValueError("trainable_embedding must be bool")
         if self.measurement_mode not in MEASUREMENT_MODES:
             raise ValueError(f"measurement_mode must be one of {MEASUREMENT_MODES}")
         if self.shots is not None and (type(self.shots) is not int or self.shots < 1):
@@ -141,6 +144,7 @@ class QuantumBlock(nn.Module):
         self.sampling_rng = np.random.default_rng(config.measurement_seed)
         self.backprop_sampling_rng = torch.Generator().manual_seed(config.measurement_seed)
         self.weights = nn.Parameter(0.05 * torch.randn(depth, 8, len(config.rotation_gates)))
+        self.register_parameter("embedding_scale", nn.Parameter(torch.ones(8)) if config.trainable_embedding else None)
         device = qml.device("default.qubit", wires=8, seed=self.sampling_rng)
         rotation_ops = {"RX": qml.RX, "RY": qml.RY, "RZ": qml.RZ}
         observable = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}[config.measurement]
@@ -198,6 +202,8 @@ class QuantumBlock(nn.Module):
         self.backprop_sampling_rng.manual_seed(seed)
 
     def forward(self, inputs):
+        if self.embedding_scale is not None:
+            inputs = inputs * self.embedding_scale
         # PennyLane uses double precision internally; keep the classical model's dtype.
         if effective_shots(self.config, self.training) and self.config.measurement_mode != "parameter_shift":
             probabilities = self.probability_circuit(inputs, self.weights)
