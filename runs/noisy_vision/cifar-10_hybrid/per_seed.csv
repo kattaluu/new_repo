@@ -1,0 +1,4 @@
+seed,stage,stage_index,output,test_accuracy,test_macro_f1,test_balanced_accuracy,test_loss,val_accuracy,val_macro_f1
+0,hybrid,0,..\runs\noisy_vision\cifar-10_hybrid\seed_0,0.272,0.24610547464743499,0.272,2.0840704441070557,0.316,0.2906177730466681
+20,hybrid,0,..\runs\noisy_vision\cifar-10_hybrid\seed_20,0.3,0.2513686102255959,0.3,1.9855988025665283,0.336,0.2800140960800147
+40,hybrid,0,..\runs\noisy_vision\cifar-10_hybrid\seed_40,0.292,0.25428092436140276,0.29200000000000004,1.9931247234344482,0.276,0.24969624015965047
