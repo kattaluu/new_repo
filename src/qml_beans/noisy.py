@@ -53,9 +53,9 @@ class NoiseConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} должно быть конечным и неотрицательным")
-        if self.backend not in ("torch_density", "pennylane_mixed", "pennylane_statevector"):
+        if self.backend not in ("torch_density", "pennylane_mixed", "pennylane_statevector", "aer_statevector", "aer_density_matrix"):
             raise ValueError("Неизвестный шумовой бэкенд")
-        if self.backend == "pennylane_statevector" and self.enabled:
+        if self.backend in ("pennylane_statevector", "aer_statevector") and self.enabled:
             raise ValueError("Идеальный state vector не поддерживает T1/T2: отключите шум или выберите матрицу плотности")
         if self.precision not in ("float32", "float64"):
             raise ValueError("precision: float32 или float64")
@@ -377,6 +377,9 @@ class NoisyHybridClassifier(HybridClassifier):
         self.noise = noise
         if noise.backend == "pennylane_statevector":
             self.quantum = QuantumBlock(config.quantum_depth, config, gate_errors=compile_gate_errors(noise))
+        elif noise.backend in ("aer_statevector", "aer_density_matrix"):
+            from .aer import AerBlock
+            self.quantum = AerBlock(config, noise)
         else:
             block = TorchDensityBlock if noise.backend == "torch_density" else PennyLaneMixedBlock
             self.quantum = block(config, noise)

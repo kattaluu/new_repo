@@ -29,6 +29,15 @@ cell('markdown', r"""
 - `torch_density`: специализированная матрица плотности 256×256, автодифференцирование PyTorch;
 - `pennylane_mixed`: эталонный `default.mixed`, `ThermalRelaxationError`, `backprop`;
 - `pennylane_statevector`: идеальный `default.qubit` без T1/T2, для сравнения с шумовыми моделями.
+- `aer_statevector`: Qiskit Aer, без T1/T2; фиксированные ошибки вентилей и shots поддерживаются.
+- `aer_density_matrix`: Qiskit Aer с T1/T2, ошибками вентилей и shots.
+
+Для Aer установите `python -m pip install -e ".[aer]"` в окружении ядра.
+Градиенты проходят через квантовый блок к классическому энкодеру. Aer вычисляет их
+через parameter-shift: с выборочными измерениями в режиме `parameter_shift`,
+с точными средними для аналитического Jacobian в остальных режимах.
+При `shots=0` все расчёты аналитические. Это не нативный backprop Aer.
+Statevector отключает только T1/T2; флажок ошибок вентилей независим.
 
 Шум T1/T2 рассчитывается детерминированно через матрицу плотности. Статистика измерений задаётся отдельно числом shots. Seed обучения отвечает за веса и порядок данных, seed измерений — за выборку результатов.
 «Точный» здесь относится к эволюции выбранного канала, а не к гарантированной точности классификации.
@@ -170,8 +179,8 @@ $\rho_{01}(t)=\rho_{01}(0)e^{-t/T_2}$.
 """, 'noise-help')
 
 cell('code', r"""
-pre_editor = LayerEditor("Слои до квантовой части", (32,), ("relu", "tanh"))
-post_editor = LayerEditor("Слои после квантовой части", (16,), ("relu",))
+pre_editor = LayerEditor("Слои до квантовой части", (), ())
+post_editor = LayerEditor("Слои после квантовой части", (), ())
 depth = w.BoundedIntText(value=2, min=1, max=20, description="Квант. слоёв:")
 embedding = w.Dropdown(options=["RY", "RX", "RZ"], value="RX", description="Кодирование:")
 rotations = w.Text(value="RY,RX", description="Вращения:")
@@ -181,7 +190,7 @@ entangler = w.Dropdown(options=["CNOT", "CZ"], description="Вентиль:")
 measurement = w.Dropdown(options=["Z", "X", "Y"], description="Измерение:")
 hadamard = w.Checkbox(value=False, description="Начальные H")
 reupload = w.Checkbox(value=False, description="Повторное кодирование")
-backend = w.Dropdown(options=[("PyTorch: матрица плотности", "torch_density"), ("PennyLane: матрица плотности", "pennylane_mixed"), ("PennyLane: вектор состояния", "pennylane_statevector")], layout=w.Layout(width="500px"), description="Бэкенд:")
+backend = w.Dropdown(options=[("PyTorch: матрица плотности", "torch_density"), ("PennyLane: матрица плотности", "pennylane_mixed"), ("PennyLane: вектор состояния", "pennylane_statevector"), ("Qiskit Aer: statevector", "aer_statevector"), ("Qiskit Aer: density matrix", "aer_density_matrix")], layout=w.Layout(width="500px"), description="Бэкенд:")
 precision = w.Dropdown(options=["float32", "float64"], description="Точность:")
 noise_on = w.Checkbox(value=True, description="Шум T1/T2 включён")
 t1 = w.Text(value="40", description="T1, мкс:", layout=w.Layout(width="650px"))
@@ -196,7 +205,7 @@ display(w.VBox([depth, embedding, rotations, topology, custom_edges, entangler, 
 # При выборе идеального бэкенда значения T1/T2 сохраняются; шум отключается явно.
 _previous_noise = {"enabled": noise_on.value}
 def sync_backend_controls(change=None):
-    ideal = backend.value == "pennylane_statevector"
+    ideal = backend.value in ("pennylane_statevector", "aer_statevector")
     if ideal and not noise_on.disabled:
         _previous_noise["enabled"] = noise_on.value
         noise_on.value = False
@@ -320,12 +329,12 @@ print("Первое число — входные признаки; в реда�
 print(model.encoder)
 print(model.head)
 print("Длительность схемы, мкс:", sum(step[2] for step in circuit_schedule(model_config, noise_config)))
-if noise_config.backend == "pennylane_statevector":
+if noise_config.backend in ("pennylane_statevector", "aer_statevector"):
     print("Вектор состояния: 256 комплексных амплитуд на объект; T1/T2 отключены.")
 else:
     print("Элементов матрицы плотности на объект:", 256 * 256)
 
-print("Измерение:", measurement_description(model_config))
+print("Измерение:", measurement_description(model_config, backend=noise_config.backend))
 """, 'create-model')
 
 cell('markdown', r"""

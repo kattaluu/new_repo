@@ -67,8 +67,10 @@ def readout_with_analytic_jacobian(probabilities, shots, generator):
     return sampled_with_analytic_jacobian(mean, sampled)
 
 
-def measurement_description(config):
+def measurement_description(config, *, backend=None):
     if config.shots is None:
+        if backend is not None and backend.startswith("aer_"):
+            return "Аналитические средние, точный parameter-shift (shots=None)"
         return "Аналитические средние, backprop (shots=None)"
     labels = {
         "parameter_shift": "Выборочные измерения и parameter-shift при обучении",
