@@ -10,8 +10,9 @@ from torch import nn
 
 from .model import HybridClassifier, ModelConfig, QuantumBlock
 from .gate_errors import compile_gate_errors
+from .encoding import encode_features, encoding_index, encoding_parameter
 from .measurements import (effective_shots, readout_with_analytic_jacobian, rotate_measurement_basis,
-                           sample_expectations, sampled_with_analytic_jacobian)
+                           sample_expectations, sampled_with_analytic_jacobian, reinforce_readout)
 
 
 @dataclass(frozen=True)
@@ -138,16 +139,16 @@ class TorchDensityBlock(nn.Module):
         super().__init__()
         self.config, self.noise = config, noise
         self.weights = nn.Parameter(0.05 * torch.randn(config.quantum_depth, 8, len(config.rotation_gates)))
-        self.register_parameter("embedding_scale", nn.Parameter(torch.ones(8)) if config.trainable_embedding else None)
+        self.register_parameter("embedding_scale", encoding_parameter(config))
         self.schedule = circuit_schedule(config, noise)
         self.gate_errors = compile_gate_errors(noise)
-        if self.gate_errors:
+        self.compiled_gate_moments = {}
+        if self.gate_errors or config.entangler == "iSWAP":
             # Fixed monomial two-qubit gates become one cached gather/multiply per moment.
             indices = np.arange(256)
             compiled = {}
-            self.compiled_gate_moments = {}
             for moment, (gate, info, _) in enumerate(self.schedule):
-                if gate.removesuffix("_parallel") not in ("CNOT", "CZ"):
+                if gate.removesuffix("_parallel") not in ("CNOT", "CZ", "iSWAP"):
                     continue
                 kind = gate.removesuffix("_parallel")
                 edges = info if gate.endswith("_parallel") else (info,)
@@ -160,9 +161,13 @@ class TorchDensityBlock(nn.Module):
                     c, t = (indices >> (7 - control)) & 1, (indices >> (7 - target)) & 1
                     if kind == "CNOT":
                         permutation ^= c << (7 - target)
-                    else:
+                    elif kind == "CZ":
                         phases *= 1 - 2 * (c & t)
-                    angle = self.gate_errors.two_angles[kind][control, target]
+                    else:
+                        different = c ^ t
+                        permutation ^= (different << (7 - control)) | (different << (7 - target))
+                        phases *= np.where(different, 1j, 1)
+                    angle = self.gate_errors.two_angles[kind][control, target] if self.gate_errors else 0.0
                     phases *= np.exp(-0.5j * angle * (1 - 2 * (c ^ t)))
                 self.register_buffer(f"gate_indices_{moment}", torch.from_numpy(
                     (permutation[:, None] * 256 + permutation[None, :]).reshape(-1)), persistent=False)
@@ -177,8 +182,7 @@ class TorchDensityBlock(nn.Module):
         self.sampling_rng.manual_seed(seed)
 
     def density_matrix(self, inputs, weights=None, shift=None):
-        if self.embedding_scale is not None:
-            inputs = inputs * self.embedding_scale
+        inputs = encode_features(inputs, self.embedding_scale, self.config)
         return self._density_matrix_encoded(inputs, weights, shift)
 
     def _density_matrix_encoded(self, inputs, weights=None, shift=None):
@@ -188,8 +192,11 @@ class TorchDensityBlock(nn.Module):
         ket[:, 0] = 1
         rho = ket.unsqueeze(-1) * ket.conj().unsqueeze(-2)
         indices = torch.arange(256, device=inputs.device)
+        occurrence = -1
         for moment, (gate, info, duration) in enumerate(self.schedule):
-            if self.gate_errors and gate.removesuffix("_parallel") in ("CNOT", "CZ"):
+            if gate == "embed":
+                occurrence += 1
+            if moment in self.compiled_gate_moments:
                 compiled_moment = self.compiled_gate_moments[moment]
                 gather = getattr(self, f"gate_indices_{compiled_moment}")
                 phases = torch.view_as_complex(getattr(self, f"gate_phases_{compiled_moment}"))
@@ -211,7 +218,7 @@ class TorchDensityBlock(nn.Module):
                         unitary = (torch.as_tensor(self.gate_errors.hadamards[wire], dtype=dtype, device=inputs.device)
                                    if self.gate_errors else inputs.new_tensor([[1, 1], [1, -1]]).to(dtype) / math.sqrt(2))
                     elif gate == "embed":
-                        theta = torch.pi * inputs[:, wire]
+                        theta = torch.pi * inputs[:, encoding_index(self.config, occurrence, wire)]
                         if shift is not None and (moment, wire) == shift[:2]:
                             theta = theta + shift[2]
                         if self.gate_errors:
@@ -247,6 +254,8 @@ class TorchDensityBlock(nn.Module):
         mean = probabilities @ self.z_signs.to(inputs.dtype)
         shots = effective_shots(self.config, self.training)
         if shots:
+            if self.config.measurement_mode == "reinforce":
+                return reinforce_readout(self, probabilities, shots, self.sampling_rng)
             with torch.no_grad():
                 sampled = sample_expectations(probabilities.detach(), shots, self.sampling_rng)
             if self.config.measurement_mode != "parameter_shift":
@@ -255,8 +264,8 @@ class TorchDensityBlock(nn.Module):
         return mean
 
     def forward(self, inputs):
-        if self.embedding_scale is not None:
-            inputs = inputs * self.embedding_scale
+        self._reinforce_score = self._reinforce_mean = None
+        inputs = encode_features(inputs, self.embedding_scale, self.config)
         if self.config.shots and self.config.measurement_mode == "parameter_shift":
             return _ShotParameterShift.apply(inputs, self.weights, self)
         return self._measure(inputs)
@@ -278,8 +287,11 @@ class _ShotParameterShift(torch.autograd.Function):
         input_gradient = torch.zeros_like(inputs) if ctx.needs_input_grad[0] else None
         weight_gradient = torch.zeros_like(weights) if ctx.needs_input_grad[1] else None
         with torch.no_grad():
+            occurrence = -1
             for moment, (gate, info, _) in enumerate(block.schedule):
                 is_input = gate == "embed"
+                if is_input:
+                    occurrence += 1
                 if (is_input and input_gradient is None) or (not is_input and weight_gradient is None):
                     continue
                 if not is_input and gate not in ("RX", "RY", "RZ"):
@@ -289,8 +301,8 @@ class _ShotParameterShift(torch.autograd.Function):
                     minus = block._measure(inputs, weights, (moment, wire, -math.pi / 2))
                     contribution = ((plus - minus) * upstream).sum(dim=-1) / 2
                     if is_input:
-                        # Reuploaded features have multiple gate occurrences; sum their derivatives.
-                        input_gradient[:, wire] += math.pi * contribution
+                        index = encoding_index(block.config, occurrence, wire)
+                        input_gradient[:, index] += math.pi * contribution
                     else:
                         layer, gate_index = info
                         weight_gradient[layer, wire, gate_index] += contribution.sum()
@@ -305,22 +317,25 @@ class PennyLaneMixedBlock(nn.Module):
         self.sampling_rng = np.random.default_rng(config.measurement_seed)
         self.backprop_sampling_rng = torch.Generator().manual_seed(config.measurement_seed)
         self.weights = nn.Parameter(0.05 * torch.randn(config.quantum_depth, 8, len(config.rotation_gates)))
-        self.register_parameter("embedding_scale", nn.Parameter(torch.ones(8)) if config.trainable_embedding else None)
+        self.register_parameter("embedding_scale", encoding_parameter(config))
         rotations = {"RX": qml.RX, "RY": qml.RY, "RZ": qml.RZ}
         observable = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}[config.measurement]
         schedule = circuit_schedule(config, noise)
         errors = compile_gate_errors(noise)
 
         def operations(inputs, weights):
+            occurrence = -1
             for gate, info, duration in schedule:
-                if gate in ("CNOT", "CZ", "CNOT_parallel", "CZ_parallel"):
+                if gate == "embed":
+                    occurrence += 1
+                if gate in ("CNOT", "CZ", "iSWAP", "CNOT_parallel", "CZ_parallel", "iSWAP_parallel"):
                     edges = info if gate.endswith("_parallel") else (info,)
                     for edge in edges:
                         kind = gate.removesuffix("_parallel")
                         if errors:
                             qml.QubitUnitary(errors.entangler(kind, edge), wires=edge)
                         else:
-                            {"CNOT": qml.CNOT, "CZ": qml.CZ}[kind](wires=edge)
+                            {"CNOT": qml.CNOT, "CZ": qml.CZ, "iSWAP": qml.ISWAP}[kind](wires=edge)
                 elif gate != "idle":
                     for wire in range(8):
                         if gate == "H":
@@ -330,7 +345,8 @@ class PennyLaneMixedBlock(nn.Module):
                                 qml.Hadamard(wire)
                         elif gate == "embed":
                             offset = errors.offset(config.embedding, wire) if errors else 0.0
-                            rotations[config.embedding](torch.pi * inputs[..., wire] + offset, wires=wire)
+                            index = encoding_index(config, occurrence, wire)
+                            rotations[config.embedding](torch.pi * inputs[..., index] + offset, wires=wire)
                         else:
                             layer, gate_index = info
                             offset = errors.offset(gate, wire) if errors else 0.0
@@ -361,10 +377,12 @@ class PennyLaneMixedBlock(nn.Module):
         self.backprop_sampling_rng.manual_seed(seed)
 
     def forward(self, inputs):
-        if self.embedding_scale is not None:
-            inputs = inputs * self.embedding_scale
+        self._reinforce_score = self._reinforce_mean = None
+        inputs = encode_features(inputs, self.embedding_scale, self.config)
         if effective_shots(self.config, self.training) and self.config.measurement_mode != "parameter_shift":
             probabilities = self.probability_circuit(inputs, self.weights)
+            if self.config.measurement_mode == "reinforce":
+                return reinforce_readout(self, probabilities, self.shots, self.backprop_sampling_rng).to(inputs.dtype)
             return readout_with_analytic_jacobian(probabilities, self.shots, self.backprop_sampling_rng).to(inputs.dtype)
         if self.shots and self.config.measurement_mode == "parameter_shift":
             return torch.stack([torch.stack(self.circuit(row, self.weights)) for row in inputs]).to(inputs.dtype)

@@ -1,4 +1,4 @@
-"""An eight-dimensional interface allows switching the circuit on and off."""
+"""An eight-qubit circuit with a configurable classical interface and bypass."""
 
 from dataclasses import asdict, dataclass
 
@@ -6,9 +6,11 @@ import pennylane as qml
 import numpy as np
 import torch
 from torch import nn
+from .classical import build_classical_block, normalize_image_shape, normalize_spec
+from .encoding import encode_features, encoding_index, encoding_parameter
 
 from .measurements import (MEASUREMENT_MODES, effective_shots, readout_with_analytic_jacobian,
-                           rotate_measurement_basis)
+                           rotate_measurement_basis, reinforce_readout)
 
 
 ACTIVATIONS = {
@@ -43,11 +45,27 @@ class ModelConfig:
     shots: int | None = None
     measurement_seed: int = 42
     measurement_mode: str = "parameter_shift"
-    trainable_embedding: bool = False
+    trainable_embedding: bool = True
+    embedding_parameterization: str = "per_rotation"
+    encoder_spec: tuple[dict, ...] | None = None
+    head_spec: tuple[dict, ...] | None = None
+    image_shape: tuple[int, int, int] | None = None
+    latent_features: int = 8
 
     def __post_init__(self):
+        if type(self.latent_features) is not int or self.latent_features < 1:
+            raise ValueError("latent_features: положительное целое")
+        if self.entangler in ("ISWAP", "iswap"):
+            object.__setattr__(self, "entangler", "iSWAP")
+        object.__setattr__(self, "encoder_spec", normalize_spec(self.encoder_spec))
+        object.__setattr__(self, "head_spec", normalize_spec(self.head_spec))
+        object.__setattr__(self, "image_shape", normalize_image_shape(self.image_shape, self.n_features))
+        if self.image_shape is not None and self.encoder_spec is None:
+            raise ValueError("image_shape используется вместе с encoder_spec")
         if type(self.trainable_embedding) is not bool:
             raise ValueError("trainable_embedding must be bool")
+        if self.embedding_parameterization not in ("per_rotation", "shared"):
+            raise ValueError("embedding_parameterization: per_rotation / shared")
         if self.measurement_mode not in MEASUREMENT_MODES:
             raise ValueError(f"measurement_mode must be one of {MEASUREMENT_MODES}")
         if self.shots is not None and (type(self.shots) is not int or self.shots < 1):
@@ -84,8 +102,8 @@ class ModelConfig:
         if self.entanglement not in ("ring", "linear", "brickwork", "brickwork3", "full", "none", "custom"):
             raise ValueError(f"Unsupported entanglement topology: {self.entanglement!r}. "
                              "Choose ring, linear, brickwork, brickwork3, full, none or custom")
-        if self.entangler not in ("CNOT", "CZ") or self.measurement not in ("X", "Y", "Z"):
-            raise ValueError("Entangler must be CNOT/CZ and measurement must be X/Y/Z")
+        if self.entangler not in ("CNOT", "CZ", "iSWAP") or self.measurement not in ("X", "Y", "Z"):
+            raise ValueError("Entangler must be CNOT/CZ/iSWAP and measurement must be X/Y/Z")
         for edge in self.custom_edges:
             if len(edge) != 2 or any(type(wire) is not int or not 0 <= wire < 8 for wire in edge):
                 raise ValueError("Each custom edge needs two integer wire indices in 0..7")
@@ -122,6 +140,14 @@ class ModelConfig:
         return self.custom_edges if self.entanglement == "custom" else ()
 
 
+def saved_model_config(values):
+    """Restore historical shared/nontrainable encoding without changing old predictions."""
+    values = dict(values)
+    values.setdefault("embedding_parameterization", "shared")
+    values.setdefault("trainable_embedding", False)
+    return ModelConfig(**values)
+
+
 def dense_block(n_inputs, widths, activations, n_outputs, output_activation=None):
     modules = []
     for width, activation in zip(widths, activations):
@@ -144,15 +170,15 @@ class QuantumBlock(nn.Module):
         self.sampling_rng = np.random.default_rng(config.measurement_seed)
         self.backprop_sampling_rng = torch.Generator().manual_seed(config.measurement_seed)
         self.weights = nn.Parameter(0.05 * torch.randn(depth, 8, len(config.rotation_gates)))
-        self.register_parameter("embedding_scale", nn.Parameter(torch.ones(8)) if config.trainable_embedding else None)
+        self.register_parameter("embedding_scale", encoding_parameter(config))
         device = qml.device("default.qubit", wires=8, seed=self.sampling_rng)
         rotation_ops = {"RX": qml.RX, "RY": qml.RY, "RZ": qml.RZ}
         observable = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}[config.measurement]
-        entangler = {"CNOT": qml.CNOT, "CZ": qml.CZ}[config.entangler]
+        entangler = {"CNOT": qml.CNOT, "CZ": qml.CZ, "iSWAP": qml.ISWAP}[config.entangler]
 
-        def embed(inputs):
+        def embed(inputs, occurrence):
             for wire in range(8):
-                theta = torch.pi * inputs[..., wire]
+                theta = torch.pi * inputs[..., encoding_index(config, occurrence, wire)]
                 if gate_errors:
                     theta = theta + gate_errors.offset(config.embedding, wire)
                 rotation_ops[config.embedding](theta, wires=wire)
@@ -164,10 +190,10 @@ class QuantumBlock(nn.Module):
                         qml.QubitUnitary(gate_errors.hadamards[wire], wires=wire)
                     else:
                         qml.Hadamard(wires=wire)
-            embed(inputs)
+            embed(inputs, 0)
             for layer in range(depth):
                 if layer > 0 and config.reupload:
-                    embed(inputs)
+                    embed(inputs, layer)
                 for wire in range(8):
                     for gate_index, gate in enumerate(config.rotation_gates):
                         theta = weights[layer, wire, gate_index]
@@ -202,11 +228,13 @@ class QuantumBlock(nn.Module):
         self.backprop_sampling_rng.manual_seed(seed)
 
     def forward(self, inputs):
-        if self.embedding_scale is not None:
-            inputs = inputs * self.embedding_scale
+        self._reinforce_score = self._reinforce_mean = None
+        inputs = encode_features(inputs, self.embedding_scale, self.config)
         # PennyLane uses double precision internally; keep the classical model's dtype.
         if effective_shots(self.config, self.training) and self.config.measurement_mode != "parameter_shift":
             probabilities = self.probability_circuit(inputs, self.weights)
+            if self.config.measurement_mode == "reinforce":
+                return reinforce_readout(self, probabilities, self.shots, self.backprop_sampling_rng).to(inputs.dtype)
             return readout_with_analytic_jacobian(probabilities, self.shots, self.backprop_sampling_rng).to(inputs.dtype)
         if self.shots and self.config.measurement_mode == "parameter_shift":
             # Finite-shot parameter-shift must see individual tapes, not broadcasted inputs.
@@ -218,23 +246,47 @@ class HybridClassifier(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.encoder = dense_block(config.n_features, config.encoder_widths,
-                                   config.encoder_activations, 8, config.latent_activation)
+        width = config.latent_features
+        self.encoder = (build_classical_block(config.encoder_spec, config.n_features, width,
+                                             image_shape=config.image_shape, label="Энкодер")
+                        if config.encoder_spec is not None else
+                        dense_block(config.n_features, config.encoder_widths,
+                                    config.encoder_activations, width, config.latent_activation))
+        self.quantum_input = nn.Sequential(nn.Linear(width, 8), nn.Tanh()) if width != 8 else nn.Identity()
+        self.quantum_output = nn.Linear(8, width) if width != 8 else nn.Identity()
         # Always instantiate it: checkpoints contain quantum weights even in bypass mode.
         self.quantum = QuantumBlock(config.quantum_depth, config)
-        self.head = dense_block(8, config.head_widths, config.head_activations, config.n_classes)
+        self.head = (build_classical_block(config.head_spec, width, config.n_classes, label="Голова")
+                     if config.head_spec is not None else
+                     dense_block(width, config.head_widths, config.head_activations, config.n_classes))
         self.set_mode()
 
     def set_mode(self, *, quantum=True, train_classical=True, train_quantum=True):
         self.use_quantum = bool(quantum)
         self.train_classical = bool(train_classical)
         self.train_quantum = bool(train_quantum)
-        for module in (self.encoder, self.head):
+        for module in self.classical_modules():
             module.requires_grad_(self.train_classical)
+        for module in (self.quantum_input, self.quantum_output):
+            module.requires_grad_(self.train_classical and self.use_quantum)
         self.quantum.requires_grad_(self.train_quantum and self.use_quantum)
         # Clear stale gradients when changing modes on an existing instance.
         for parameter in self.parameters():
             parameter.grad = None
+        self.train(self.training)
+
+    def classical_modules(self):
+        return self.encoder, self.quantum_input, self.quantum_output, self.head
+
+    def train(self, mode=True):
+        super().train(mode)
+        if not getattr(self, "train_classical", True):
+            for module in self.classical_modules():
+                module.eval()
+        return self
+
+    def classify_readout(self, readout):
+        return self.head(self.quantum_output(readout))
 
     def mode_dict(self):
         return dict(quantum=self.use_quantum, train_classical=self.train_classical,
@@ -247,5 +299,6 @@ class HybridClassifier(nn.Module):
         latent = self.encoder(features)
         if self.use_quantum:
             # Do not detach: a frozen circuit must still pass gradients to the encoder.
-            latent = self.quantum(latent)
+            latent = self.quantum(self.quantum_input(latent))
+            latent = self.quantum_output(latent)
         return self.head(latent)

@@ -3,31 +3,18 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "qml-beans"
+name = "qml_hybrid"
 version = "0.1.0"
-description = "Switchable 8-qubit hybrid classifier for tabular data"
+description = "Eight-qubit hybrid image classifier on PyTorch and PennyLane"
 requires-python = ">=3.11"
 dependencies = [
-  "torch>=2.6,<3",
-  "pennylane>=0.43,<0.46",
-  "numpy>=2.0,<3",
-  "pandas>=2.2,<4",
-  "scikit-learn>=1.5,<2",
-  "scipy>=1.14,<2",
+  "torch>=2.6,<3", "pennylane>=0.43,<0.46", "numpy>=2.0,<3",
+  "pandas>=2.2,<4", "scikit-learn>=1.5,<2", "scipy>=1.14,<2",
+  "matplotlib>=3.9,<4",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10"]
-notebook = [
-  "jupyterlab>=4.3,<5", "ipykernel>=6.29,<8", "ipywidgets>=8.1,<9",
-  "nbformat>=5.10,<6", "nbclient>=0.10,<1", "matplotlib>=3.9,<4",
-]
-
-[project.scripts]
-qml-beans = "qml_beans.cli:main"
+notebook = ["jupyterlab>=4.3,<5", "ipykernel>=6.29,<8"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

@@ -122,21 +122,44 @@ class VisionData:
             dict(Выборка=label, Класс=name, Количество=int((y == index).sum()),
                  Доля=float((y == index).float().mean()))
             for label, y in (("Обучающая", self.train_y), ("Валидационная", self.val_y), ("Тестовая", self.test_y))
+            if len(y)
             for index, name in enumerate(self.classes)
         ])
 
 
+def image_features(images, image_size, *, grayscale=False):
+    """NCHW uint8 -> flattened float32 in [-1, 1]; grayscale before resize."""
+    x = torch.from_numpy(np.asarray(images).copy()).float() / 255
+    if grayscale:
+        if x.shape[1] == 3:
+            weights = x.new_tensor([.299, .587, .114]).reshape(1, 3, 1, 1)
+            x = (x * weights).sum(dim=1, keepdim=True)
+        elif x.shape[1] != 1:
+            raise ValueError("Grayscale: ожидается 1 или 3 канала")
+    if len(x) == 0:
+        return x.new_empty((0, x.shape[1] * image_size * image_size))
+    x = interpolate(x, size=(image_size, image_size), mode="bilinear", align_corners=False, antialias=True)
+    return (2 * x - 1).flatten(1)
+
+
 def prepare_vision_arrays(train_x, train_y, test_x, test_y, *, name, image_size=14,
-                          val_size=0.15, seed=42, train_limit=0, val_limit=0, test_limit=0):
-    if name not in DATASET_CLASSES or not 0 < val_size < 1 or image_size < 2:
-        raise ValueError("Некорректные настройки данных")
+                          val_size=0.15, seed=42, train_limit=0, val_limit=0, test_limit=0, grayscale=False):
+    if type(grayscale) is not bool:
+        raise ValueError("grayscale: True или False")
+    if name not in DATASET_CLASSES or not 0 <= val_size < 1 or image_size < 2:
+        raise ValueError(f"Некорректные настройки данных: dataset={name!r}, image_size={image_size!r}, "
+                         f"val_size={val_size!r}. Допустимо: известный датасет, сторона >= 2, "
+                         "0 <= val_size < 1 (0 — без валидации).")
     if any(type(limit) is not int or limit < 0 for limit in (train_limit, val_limit, test_limit)):
         raise ValueError("Лимиты должны быть неотрицательными целыми (0 = без ограничения)")
     train_y, test_y = np.asarray(train_y, dtype=np.int64), np.asarray(test_y, dtype=np.int64)
     if not (set(train_y) == set(test_y) == set(range(10))):
         raise ValueError("Нужны все 10 классов с метками 0..9 в официальных выборках")
-    train_indices, val_indices = train_test_split(np.arange(len(train_y)), test_size=val_size,
-                                                 random_state=seed, stratify=train_y)
+    if val_size:
+        train_indices, val_indices = train_test_split(np.arange(len(train_y)), test_size=val_size,
+                                                     random_state=seed, stratify=train_y)
+    else:
+        train_indices, val_indices = np.arange(len(train_y)), np.empty(0, dtype=np.int64)
 
     def subset(indices, y, limit):
         if limit and limit < len(indices):
@@ -146,20 +169,24 @@ def prepare_vision_arrays(train_x, train_y, test_x, test_y, *, name, image_size=
     train_indices = subset(train_indices, train_y, train_limit)
     val_indices = subset(val_indices, train_y, val_limit)
     test_indices = subset(np.arange(len(test_y)), test_y, test_limit)
+    channels = 1 if grayscale else int(train_x.shape[1])
 
     def features(images, indices):
+        if not len(indices):
+            return torch.empty((0, channels * image_size * image_size), dtype=torch.float32)
         chunks = []
         for offset in range(0, len(indices), 512):
-            x = torch.from_numpy(images[indices[offset:offset + 512]].copy()).float() / 255
-            x = interpolate(x, size=(image_size, image_size), mode="bilinear", align_corners=False, antialias=True)
-            chunks.append((2 * x - 1).flatten(1))
+            chunks.append(image_features(images[indices[offset:offset + 512]], image_size, grayscale=grayscale))
         return torch.cat(chunks)
 
-    metadata = dict(dataset=name, seed=seed, image_size=image_size, channels=int(train_x.shape[1]),
+    metadata = dict(dataset=name, seed=seed, image_size=image_size, channels=channels,
                     normalization="pixel/127.5 - 1; bilinear resize; no fitted statistics",
                     official_train_size=len(train_y), official_test_size=len(test_y), val_size=val_size,
-                    subset=bool(train_limit or val_limit or test_limit),
+                    subset=bool(train_limit or (val_limit if val_size else 0) or test_limit),
                     indices=dict(train=train_indices.tolist(), val=val_indices.tolist(), test=test_indices.tolist()))
+    if grayscale:
+        metadata["grayscale"] = True
+        metadata["normalization"] = "RGB -> 0.299 R + 0.587 G + 0.114 B; " + metadata["normalization"]
     digest = hashlib.sha256()
     for array in (train_x, train_y, test_x, test_y):
         digest.update(memoryview(np.ascontiguousarray(array)))
