@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "qml-beans"
+name = "qml_hybrid"
 version = "0.1.0"
-description = "Switchable 8-qubit hybrid classifier for tabular data"
+description = "Switchable 8-qubit hybrid classifier for tabular data and images"
 requires-python = ">=3.11"
 dependencies = [
   "torch>=2.6,<3",
@@ -24,7 +24,7 @@ notebook = [
 ]
 
 [project.scripts]
-qml-beans = "qml_beans.cli:main"
+qml-hybrid = "qml_hybrid.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -6,11 +6,11 @@ import numpy as np
 import pytest
 import torch
 
-from qml_beans.model import ModelConfig, QuantumBlock
-from qml_beans.noisy import (NoiseConfig, NoisyHybridClassifier, PennyLaneMixedBlock,
+from qml_hybrid.model import ModelConfig, QuantumBlock
+from qml_hybrid.noisy import (NoiseConfig, NoisyHybridClassifier, PennyLaneMixedBlock,
                              TorchDensityBlock, thermal_channel)
-from qml_beans.vision_data import prepare_vision_arrays, read_idx
-from qml_beans.vision_training import CPUConfig, CPUEngine, fit_vision, load_noisy_checkpoint
+from qml_hybrid.vision_data import prepare_vision_arrays, read_idx
+from qml_hybrid.vision_training import CPUConfig, CPUEngine, fit_vision, load_noisy_checkpoint
 
 
 @pytest.fixture(autouse=True)
@@ -190,7 +190,7 @@ def test_read_idx_and_invalid_noise(tmp_path):
 @pytest.mark.parametrize("entangler", ["CNOT", "CZ"])
 @pytest.mark.parametrize("topology", ["brickwork", "brickwork3"])
 def test_brickwork_parallel_rows_physics_and_gradients(entangler, topology):
-    from qml_beans.noisy import circuit_schedule
+    from qml_hybrid.noisy import circuit_schedule
 
     config = ModelConfig(8, 2, quantum_depth=1, entanglement=topology, entangler=entangler)
     noise = NoiseConfig(single_gate_us=0.05, two_gate_us=0.3, precision="float64")

@@ -30,3 +30,12 @@ build/
 *.npy
 *.zip
 *.tar.gz
+
+# Native extensions are built locally for the current Python/OS.
+*.pyd
+*.so
+*.dll
+*.obj
+*.o
+*.lib
+*.exp
